@@ -1052,7 +1052,7 @@ def evaluate(
     verbose: bool = False,
     out: Optional[str] = None,
     use_mlflow: bool = False,
-    mlflow_experiment: str = "rezrag-retrieval-eval",
+    mlflow_experiment: str = "dinerag-retrieval-eval",
 ):
     strategies = [
         {"name": "Hybrid + Rerank", "do_rerank": True},
@@ -1063,7 +1063,7 @@ def evaluate(
     unlabeled = [q for q in TEST_QUERIES if not q["relevant"]]
 
     print(f"\n{'='*72}")
-    print(f"  RezRag Comprehensive Retrieval Evaluation")
+    print(f"  DineRAG Comprehensive Retrieval Evaluation")
     print(f"{'='*72}")
     print(f"  Retriever : {url}")
     print(f"  top_k     : {top_k}")
@@ -1360,7 +1360,7 @@ def _print_failures(records: List[Dict], strategy: str):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="RezRag Comprehensive Retrieval Evaluator"
+        description="DineRAG Comprehensive Retrieval Evaluator"
     )
     parser.add_argument(
         "--url",
@@ -1376,7 +1376,7 @@ if __name__ == "__main__":
              "set MLFLOW_TRACKING_URI to point elsewhere).",
     )
     parser.add_argument(
-        "--mlflow-experiment", type=str, default="rezrag-retrieval-eval",
+        "--mlflow-experiment", type=str, default="dinerag-retrieval-eval",
     )
     args = parser.parse_args()
 

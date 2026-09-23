@@ -1,6 +1,6 @@
-# RezRag: Production-Grade RAG System on the Yelp Business Review Dataset Entirely from Scratch
+# DineRAG: Production-Grade RAG System on the Yelp Business Review Dataset Entirely from Scratch
 
-**RezRag** is a high-performance Retrieval-Augmented Generation (RAG) system engineered to provide grounded, location-aware restaurant recommendations  **built entirely from scratch without LangChain.** It leverages a **Hybrid Search Architecture** (Dense Vectors + Sparse Keywords) fused with a Cross-Encoder Reranker to retrieve precise context from the Yelp Academic Dataset, which is then synthesized by a 4-bit quantized LLM.
+**DineRAG** is a high-performance Retrieval-Augmented Generation (RAG) system engineered to provide grounded, location-aware restaurant recommendations  **built entirely from scratch without LangChain.** It leverages a **Hybrid Search Architecture** (Dense Vectors + Sparse Keywords) fused with a Cross-Encoder Reranker to retrieve precise context from the Yelp Academic Dataset, which is then synthesized by a 4-bit quantized LLM.
 
 The system is architected as a set of decoupled, asynchronous microservices to ensure scalability and fault tolerance.
 
@@ -37,7 +37,7 @@ The system is architected as a set of decoupled, asynchronous microservices to e
 
 ## Why From Scratch?
 
-To demonstrate a real understanding of everything that happens under the hood of RAG Frameworks. RezRag is built with full control and zero abstractions. There is no managed loader, no pre-built retriever, no abstracted LLM call.
+To demonstrate a real understanding of everything that happens under the hood of RAG Frameworks. DineRAG is built with full control and zero abstractions. There is no managed loader, no pre-built retriever, no abstracted LLM call.
 
 
 ## Index
@@ -255,7 +255,7 @@ Before any retrieval occurs, every query passes through two filtering layers:
 | `food_search` | Proceed to coverage check + retrieval |
 | `location_only` | Proceed to retrieval with geo filter |
 | `greeting` | Return intro message, skip retrieval |
-| `identity` | Return RezRag description, skip retrieval |
+| `identity` | Return DineRAG description, skip retrieval |
 | `off_topic` | Return redirect message, skip retrieval |
 
 
@@ -416,7 +416,7 @@ Variance is inherent to free-tier serverless infrastructure. A paid Qdrant clust
 ## Project Structure
 
 ```
-RezRag/
+DineRAG/
 ├── ml_backend/
 │   ├── config.py             # Centralized configuration
 │   ├── retriever.py          # Hybrid search, RRF, geo-filter (FastAPI)
@@ -435,7 +435,7 @@ RezRag/
 │   ├── modal_retriever.py    # Modal serverless — retriever
 │   └── modal_generator.py    # Modal serverless — generator
 ├── dags/
-│   └── rezrag_pipeline_dag.py  # Airflow DAG 
+│   └── dinerag_pipeline_dag.py  # Airflow DAG 
 ├── .github/workflows/ci.yml  # pytest on push/PR
 ├── tests/                    # pytest suite — cache, chunking, eval metrics, generator helpers
 ├── conftest.py
@@ -464,8 +464,8 @@ RezRag/
 ### Install
 
 ```bash
-git clone https://github.com/your-username/rezrag.git
-cd rezrag
+git clone https://github.com/your-username/dinerag.git
+cd dinerag
 python -m venv venv
 source venv/bin/activate
 
@@ -500,7 +500,7 @@ python data_pipeline/embedder.py
 python data_pipeline/ingester.py
 ```
 
-**Run as an orchestrated Airflow DAG** (`dags/rezrag_pipeline_dag.py`), 4 tasks in sequence instead of 4 manual invocations. 
+**Run as an orchestrated Airflow DAG** (`dags/dinerag_pipeline_dag.py`), 4 tasks in sequence instead of 4 manual invocations. 
 
 ```bash
 pip install -r orchestration/requirements-airflow.txt   # separate venv, WSL2 on Windows

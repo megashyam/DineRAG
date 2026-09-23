@@ -326,7 +326,7 @@ async def generate_endpoint(req: GenerateRequest):
                 {
                     "type": "token",
                     "data": (
-                        "Hi! I'm RezRag, a restaurant recommendation assistant powered by real Yelp reviews 🍽️\n\n"
+                        "Hi! I'm DineRAG, a restaurant recommendation assistant powered by real Yelp reviews 🍽️\n\n"
                         "Try asking:\n"
                         "- *Best tacos in Philadelphia*\n"
                         "- *Romantic Italian dinner in Nashville*\n"

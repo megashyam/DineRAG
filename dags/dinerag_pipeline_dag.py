@@ -12,15 +12,15 @@ from airflow.sdk import dag, task
 
 
 @dag(
-    dag_id="rezrag_data_pipeline",
+    dag_id="dinerag_data_pipeline",
     description="Yelp NDJSON -> preprocess -> chunk -> embed -> ingest (Qdrant)",
     schedule=None,
     start_date=datetime(2026, 1, 1),
     catchup=False,
-    tags=["rezrag", "data-pipeline"],
+    tags=["dinerag", "data-pipeline"],
     default_args={"retries": 0},
 )
-def rezrag_data_pipeline():
+def dinerag_data_pipeline():
     @task
     def preprocess():
         from data_pipeline.preprocessor import YelpRestaurantPipeline
@@ -48,4 +48,4 @@ def rezrag_data_pipeline():
     preprocess() >> chunk() >> embed() >> ingest()
 
 
-rezrag_data_pipeline()
+dinerag_data_pipeline()

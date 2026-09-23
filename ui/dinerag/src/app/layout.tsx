@@ -10,7 +10,7 @@ const geistSans = Geist({ variable: "--font-geist-sans", subsets: ["latin"] });
 const geistMono = Geist_Mono({ variable: "--font-geist-mono", subsets: ["latin"] });
 
 export const metadata: Metadata = {
-  title: "RezRag",
+  title: "DineRAG",
   description: "RAG powered restaurant discovery",
 };
 
@@ -55,7 +55,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
                 </div>
                 <div>
                   <p style={{ margin: 0, fontSize: 15, fontWeight: 700, color: "var(--text)", lineHeight: 1 }}>
-                    RezRag
+                    DineRAG
                   </p>
                   <p style={{ margin: 0, fontSize: 10, color: "var(--text-3)", letterSpacing: "0.08em", textTransform: "uppercase", marginTop: 2 }}>
                     RAG-powered restaurant discovery

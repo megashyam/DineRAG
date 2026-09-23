@@ -82,7 +82,7 @@ def evaluate_generation(
     queries = TEST_QUERIES[:limit] if limit else TEST_QUERIES
 
     print(f"\n{'='*72}")
-    print("  RezRag Generation Quality Evaluation (DeepEval)")
+    print("  DineRAG Generation Quality Evaluation (DeepEval)")
     print(f"{'='*72}")
     print(f"  Generator : {url}")
     print(f"  Judge     : {judge_model} (via Groq)")
@@ -177,14 +177,14 @@ def _log_to_mlflow(judge_model: str, top_k: int, records: list, avg_faith: float
         mlruns_dir.mkdir(exist_ok=True)
         mlflow.set_tracking_uri(f"sqlite:///{(mlruns_dir / 'mlflow.db').as_posix()}")
 
-    mlflow.set_experiment("rezrag-generation-eval")
+    mlflow.set_experiment("dinerag-generation-eval")
     with mlflow.start_run(run_name=f"judge={judge_model}"):
         mlflow.log_params({"judge_model": judge_model, "top_k": top_k, "n_queries": len(records)})
         mlflow.log_metrics({"faithfulness": avg_faith, "answer_relevancy": avg_rel})
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="RezRag Generation Quality Evaluator (DeepEval)")
+    parser = argparse.ArgumentParser(description="DineRAG Generation Quality Evaluator (DeepEval)")
     parser.add_argument("--url", default="http://127.0.0.1:9000", help="Generator base URL")
     parser.add_argument("--top_k", type=int, default=5)
     parser.add_argument(

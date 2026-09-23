@@ -103,7 +103,7 @@ BNB_CONFIG = {
 }
 
 GROQ_SYSTEM_PROMPT = (
-    "You are RezRag, a knowledgeable and helpful local food recommendation guide on the Yelp restaurant dataset.\n\n"
+    "You are DineRAG, a knowledgeable and helpful local food recommendation guide on the Yelp restaurant dataset.\n\n"
     "Use ONLY the provided context. Do not rely on outside knowledge. Do NOT invent restaurants, dishes, prices, or locations.\n"
     "Write with warmth and specific detail pulled from the reviews — atmosphere, a standout dish, a recurring compliment —"
     " like a knowledgeable local friend giving advice. Keep it tight: a couple of sentences per point, not a full paragraph.\n\n"
@@ -888,7 +888,7 @@ NON_FOOD_PATTERNS = [
     # ── Meta / capability questions ───────────────────────────────────────────
     r"what should (i|a user|someone|people) (type|ask|say|search|write|query|enter)",
     r"what (do you|can you) (do|speciali[sz]e|help|offer|cover|know|recommend)",
-    r"how (do|can|should) (i|you|someone) use (this|you|the app|rezrag)",
+    r"how (do|can|should) (i|you|someone) use (this|you|the app|dinerag)",
     r"what (are|is) (your|this|the) (coverage|cities|locations|areas|scope|specialty)",
     r"(tell me|explain) (about yourself|what you do|how you work)",
     r"^(what|how|who|where|why|when)\??\s*$",
@@ -1013,7 +1013,7 @@ NON_RETRIEVAL_INTENTS = {"greeting", "identity", "off_topic"}
 
 INTENT_RESPONSE_MAP = {
     "greeting": (
-        "Hi! I'm RezRag, a restaurant recommendation assistant powered by real Yelp reviews 🍽️\n\n"
+        "Hi! I'm DineRAG, a restaurant recommendation assistant powered by real Yelp reviews 🍽️\n\n"
         "Try asking:\n"
         "- *Best tacos in Philadelphia*\n"
         "- *Romantic Italian dinner in Nashville*\n"
@@ -1036,7 +1036,7 @@ INTENT_RESPONSE_MAP = {
         "📍 **Alberta** — Edmonton (AB)\n"
     ),
     "identity": (
-        "Hi! I'm RezRag, a restaurant recommendation assistant powered by real Yelp reviews 🍽️\n\n"
+        "Hi! I'm DineRAG, a restaurant recommendation assistant powered by real Yelp reviews 🍽️\n\n"
         "Try asking:\n"
         "- *Best tacos in Philadelphia*\n"
         "- *Romantic Italian dinner in Nashville*\n"
