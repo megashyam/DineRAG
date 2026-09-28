@@ -1,13 +1,26 @@
+"""
+Retrieval evaluation for the /retrieve endpoint: MRR@5, Hit@3/5, P@5, latency.
+
+Labels: eval_data/qrels.json ({qid: [business_id, ...]}), built by
+eval_labels.py. Matched by business_id. Unpooled businesses count as
+non-relevant; queries with no relevant business are excluded.
+
+Requests use no_cache=True. Strategies are compared per query (paired
+bootstrap CI on ΔMRR@5, win/loss/tie). Location accuracy only sanity-checks
+the retriever's city filter.
+"""
+
 import argparse
+import hashlib
 import json
+import math
 import os
 import random
 import re
 import sys
 import time
-from collections import defaultdict
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 import requests
 from tabulate import tabulate
@@ -18,11 +31,25 @@ if _REPO_ROOT not in sys.path:
 
 import config
 
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8")
+
+
+QRELS_PATH = Path(_REPO_ROOT) / "eval_data" / "qrels.json"
+
+STRATEGIES: List[Dict] = [
+    {"name": "Hybrid + Rerank", "do_rerank": True},
+    {"name": "Hybrid (no rerank)", "do_rerank": False},
+]
+
+
 METRO_AREAS: Dict[str, List[str]] = {
     "philadelphia": [
         "philadelphia",
         "phila",
         "philadephia",
+        # PA suburbs
         "abington",
         "ardmore",
         "bala cynwyd",
@@ -75,8 +102,7 @@ METRO_AREAS: Dict[str, List[str]] = {
         "willow grove",
         "wynnewood",
         "yardley",
-        "ardmore",
-        "bala cynwyd",
+        # NJ suburbs
         "cherry hill",
         "voorhees",
         "haddonfield",
@@ -125,14 +151,13 @@ METRO_AREAS: Dict[str, List[str]] = {
         "glassboro",
         "franklinville",
         "elmer",
-        "pitman",
         "woolwich township",
         "west deptford",
         "westmont",
         "willingboro",
         "delran",
         "riverton",
-        "palmyra",
+        # DE suburbs
         "wilmington",
         "claymont",
         "christiana",
@@ -314,11 +339,9 @@ METRO_AREAS: Dict[str, List[str]] = {
     "saint_louis": [
         "saint louis",
         "st louis",
-        "st. louis",
         "chesterfield",
         "ballwin",
         "creve coeur",
-        "ballwin",
         "manchester",
         "kirkwood",
         "webster groves",
@@ -347,9 +370,10 @@ METRO_AREAS: Dict[str, List[str]] = {
         "caseyville",
         "mascoutah",
         "fairview heights",
-        "collinsville",
         "cahokia",
         "east saint louis",
+        "saint charles",
+        "saint peters",
     ],
     "wilmington": [
         "wilmington",
@@ -364,13 +388,22 @@ METRO_AREAS: Dict[str, List[str]] = {
 }
 
 
-_SUBURB_TO_METRO: Dict[str, str] = {}
-for metro, suburbs in METRO_AREAS.items():
-    for suburb in suburbs:
-        _SUBURB_TO_METRO[suburb.lower()] = metro
+def normalize_city(city: str) -> str:
+    """Lowercases, maps "St."/"St" to "saint", and replaces punctuation with spaces."""
+    s = (city or "").lower().strip()
+    s = re.sub(r"\bst\.?(?=\s)", "saint", s)
+    s = re.sub(r"[^a-z0-9 ]", " ", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+_METRO_NORMALIZED: Dict[str, Set[str]] = {
+    metro: {normalize_city(s) for s in suburbs}
+    for metro, suburbs in METRO_AREAS.items()
+}
 
 
 def _normalize(name: str) -> str:
+    """Normalizes a restaurant name for exact matching in eval_labels.py."""
     s = name.lower().strip()
     for src, dst in [
         ("àáâãäå", "a"),
@@ -383,8 +416,9 @@ def _normalize(name: str) -> str:
     ]:
         for c in src:
             s = s.replace(c, dst)
-    s = re.sub(r"[''`]", "'", s)
 
+    s = re.sub(r"[‘’ʼ´`]", "'", s)
+    # Strip city/branch suffixes
     s = re.sub(
         r"\s*[-–]\s*(nashville|philadelphia|tampa|new orleans|houston|south|north|"
         r"east|west|downtown|carrollwood|lower broadway|brandon|south philly|"
@@ -397,596 +431,503 @@ def _normalize(name: str) -> str:
     return s
 
 
-def name_match(returned: str, expected: str) -> bool:
-    """Fuzzy match: normalise → exact, prefix (len≥3), or 2+-token subset."""
-    r, e = _normalize(returned), _normalize(expected)
-    if r == e:
-        return True
-
-    if len(r) >= 3 and len(e) >= 3:
-        if r.startswith(e + " ") or e.startswith(r + " "):
-            return True
-    r_tok, e_tok = set(r.split()), set(e.split())
-    shorter = r_tok if len(r_tok) <= len(e_tok) else e_tok
-    longer = r_tok if len(r_tok) > len(e_tok) else e_tok
-    if len(shorter) >= 2 and shorter.issubset(longer):
-        return True
-    return False
-
-
-def in_relevant(result: Dict, relevant: set) -> bool:
-    name = (result.get("restaurant") or result.get("name") or "").strip()
-    return any(name_match(name, r) for r in relevant)
+#  Test queries
 
 
 TEST_QUERIES: List[Dict] = [
+    #  Philadelphia / South Jersey
     {
+        "qid": "best-tacos-in-philadelphia",
         "query": "best tacos in Philadelphia",
         "category": "cuisine",
         "city": "philadelphia",
-        "relevant": [
-            "El Purepecha",
-            "South Philly Barbacoa",
-            "Blue Corn",
-            "Mission Taqueria",
-        ],
     },
     {
+        "qid": "romantic-italian-dinner-philadelphia",
         "query": "romantic Italian dinner Philadelphia",
         "category": "occasion+cuisine",
         "city": "philadelphia",
-        "relevant": [
-            "Bistro Romano",
-            "Gran Caffe L'Aquila",
-            "L'Angolo Ristorante",
-            "Vetri Cucina",
-        ],
     },
     {
+        "qid": "late-night-bars-philadelphia",
         "query": "late night bars Philadelphia",
         "category": "time+type",
         "city": "philadelphia",
-        "relevant": [
-            "Butcher Bar",
-            "Bar Hygge",
-            "Harp & Crown",
-            "Good Dog Bar",
-            "Glory Beer Bar & Kitchen",
-        ],
     },
     {
+        "qid": "best-cheesesteak-philadelphia",
         "query": "best cheesesteak Philadelphia",
         "category": "landmark",
         "city": "philadelphia",
-        "relevant": [
-            "Dalessandro's Steaks & Hoagies",
-            "Jim's South St",
-            "John's Roast Pork",
-            "Max's Steaks",
-            "Sonny's Famous Steaks",
-        ],
     },
     {
+        "qid": "brunch-spots-philadelphia",
         "query": "brunch spots Philadelphia",
         "category": "mealtime",
         "city": "philadelphia",
-        "relevant": [
-            "Cafe Lift",
-            "Cafe La Maude",
-            "On Point Bistro",
-            "Sabrina's Café",
-            "Honey's Sit N Eat",
-        ],
     },
     {
+        "qid": "sushi-philadelphia",
         "query": "sushi Philadelphia",
         "category": "cuisine",
         "city": "philadelphia",
-        "relevant": [
-            "Hikari Sushi",
-            "Vic Sushi Bar",
-            "Bleu Sushi",
-            "Royal Sushi & Izakaya",
-            "Tomo Sushi & Ramen",
-        ],
     },
     {
+        "qid": "vegan-restaurants-philadelphia",
         "query": "vegan restaurants Philadelphia",
         "category": "dietary",
         "city": "philadelphia",
-        "relevant": ["Vedge", "Charlie Was a Sinner", "V Street", "HipCityVeg"],
     },
     {
+        "qid": "rooftop-bars-philadelphia",
         "query": "rooftop bars Philadelphia",
         "category": "ambiance",
         "city": "philadelphia",
-        "relevant": ["The Continental Mid-town", "Harp & Crown"],
     },
     {
+        "qid": "best-ramen-in-philly",
         "query": "best ramen in Philly",
         "category": "cuisine+noisy",
         "city": "philadelphia",
-        "relevant": ["Terakawa Ramen", "Tomo Sushi & Ramen", "Ramen House"],
     },
     {
+        "qid": "cheap-eats-philadelphia",
         "query": "cheap eats Philadelphia",
         "category": "budget",
         "city": "philadelphia",
-        "relevant": [],
     },
     {
+        "qid": "gluten-free-restaurants-philadelphia",
         "query": "gluten free restaurants Philadelphia",
         "category": "dietary",
         "city": "philadelphia",
-        "relevant": [],
     },
+    #  Nashville
     {
+        "qid": "best-hot-chicken-nashville",
         "query": "best hot chicken Nashville",
         "category": "landmark",
         "city": "nashville",
-        "relevant": [
-            "Hattie B's Hot Chicken",
-            "Prince's Hot Chicken Shack",
-            "Prince's Hot Chicken South",
-            "Music City Chicken",
-        ],
     },
     {
+        "qid": "romantic-dinner-nashville",
         "query": "romantic dinner Nashville",
         "category": "occasion",
         "city": "nashville",
-        "relevant": [
-            "The Optimist",
-            "Merchants",
-            "The Standard At The Smith House",
-            "Jeff Ruby's Steakhouse",
-        ],
     },
     {
+        "qid": "live-music-bars-nashville",
         "query": "live music bars Nashville",
         "category": "ambiance",
         "city": "nashville",
-        "relevant": [
-            "Jason Aldean's Kitchen + Rooftop Bar",
-            "Bourbon Street Blues & Boogie Bar",
-            "Skull's Rainbow Room",
-            "Ole Smoky Distillery",
-        ],
     },
     {
+        "qid": "best-bbq-nashville",
         "query": "best BBQ Nashville",
         "category": "cuisine",
         "city": "nashville",
-        "relevant": [
-            "Martin's Bar-B-Que Joint",
-            "HoneyFire BBQ",
-            "Charcoal Cowboys BBQ",
-        ],
     },
     {
+        "qid": "brunch-nashville",
         "query": "brunch Nashville",
         "category": "mealtime",
         "city": "nashville",
-        "relevant": [
-            "The Garden Brunch Cafe",
-            "Tavern",
-            "Another Broken Egg Cafe",
-            "Big Bad Breakfast",
-        ],
     },
     {
+        "qid": "best-tacos-nashville-tennessee",
         "query": "best tacos Nashville Tennessee",
         "category": "cuisine",
         "city": "nashville",
-        "relevant": [],
     },
     {
+        "qid": "coffee-shops-nashville",
         "query": "coffee shops Nashville",
         "category": "type",
         "city": "nashville",
-        "relevant": [],
     },
+    #  Tampa
     {
+        "qid": "best-cuban-food-tampa",
         "query": "best Cuban food Tampa",
         "category": "cuisine",
         "city": "tampa",
-        "relevant": ["Cuban Foodies", "Box Of Cubans", "La Teresita Cafe"],
     },
     {
+        "qid": "seafood-restaurants-tampa",
         "query": "seafood restaurants Tampa",
         "category": "cuisine",
         "city": "tampa",
-        "relevant": [
-            "Shells Seafood Restaurant",
-            "Eddie V's Prime Seafood",
-            "Heights Seafood",
-            "Oystercatchers",
-        ],
     },
     {
+        "qid": "best-pizza-tampa",
         "query": "best pizza Tampa",
         "category": "cuisine",
         "city": "tampa",
-        "relevant": ["Fabrica Pizza", "Eddie & Sam's NY Pizza", "Due Amici"],
     },
     {
+        "qid": "sushi-tampa",
         "query": "sushi Tampa",
         "category": "cuisine",
         "city": "tampa",
-        "relevant": ["Sushi Cafe", "Soho Sushi", "Matoi Sushi", "Izakaya Tori"],
     },
     {
+        "qid": "outdoor-dining-tampa-waterfront",
         "query": "outdoor dining Tampa waterfront",
         "category": "ambiance",
         "city": "tampa",
-        "relevant": [],
     },
     {
+        "qid": "family-friendly-restaurants-tampa",
         "query": "family friendly restaurants Tampa",
         "category": "occasion",
         "city": "tampa",
-        "relevant": [],
     },
+    #  New Orleans
     {
+        "qid": "best-gumbo-new-orleans",
         "query": "best gumbo New Orleans",
         "category": "landmark",
         "city": "new_orleans",
-        "relevant": ["Gumbo Shop", "Restaurant Rebirth", "Li'l Dizzy's Cafe"],
     },
     {
+        "qid": "late-night-food-new-orleans",
         "query": "late night food New Orleans",
         "category": "time",
         "city": "new_orleans",
-        "relevant": ["Daisy Dukes Express", "Olde Nola Cookery"],
     },
     {
+        "qid": "best-beignets-new-orleans",
         "query": "best beignets New Orleans",
         "category": "landmark",
         "city": "new_orleans",
-        "relevant": ["Café Du Monde", "Cafe Beignet on Royal Street"],
     },
     {
+        "qid": "romantic-dinner-new-orleans",
         "query": "romantic dinner New Orleans",
         "category": "occasion",
         "city": "new_orleans",
-        "relevant": [
-            "Palace Café",
-            "Mr. B's Bistro",
-            "Coquette",
-            "Broussard's",
-            "Doris Metropolitan",
-        ],
     },
     {
+        "qid": "best-po-boy-new-orleans",
         "query": "best po boy New Orleans",
         "category": "landmark",
         "city": "new_orleans",
-        "relevant": [],
     },
     {
+        "qid": "jazz-bars-with-food-nola",
         "query": "jazz bars with food NOLA",
         "category": "ambiance+noisy",
         "city": "new_orleans",
-        "relevant": [],
     },
+    #  Indianapolis
     {
+        "qid": "best-brunch-indianapolis",
         "query": "best brunch Indianapolis",
         "category": "mealtime",
         "city": "indianapolis",
-        "relevant": [
-            "Yolk - City Way",
-            "Mornings Breakfast & Brunch",
-            "RIZE - Indianapolis",
-            "Gallery Pastry Bar",
-        ],
     },
     {
+        "qid": "romantic-dinner-indianapolis",
         "query": "romantic dinner Indianapolis",
         "category": "occasion",
         "city": "indianapolis",
-        "relevant": ["Mesh Restaurant", "Capri", "Provision", "Ocean Prime"],
     },
     {
+        "qid": "best-tacos-indianapolis",
         "query": "best tacos Indianapolis",
         "category": "cuisine",
         "city": "indianapolis",
-        "relevant": [],
     },
     {
+        "qid": "craft-beer-bars-indianapolis-indiana",
         "query": "craft beer bars Indianapolis Indiana",
         "category": "type",
         "city": "indianapolis",
-        "relevant": [
-            "Twenty Tap",
-            "The Tap",
-            "Sun King Brewery",
-            "Ale Emporium",
-            "St. Joseph Brewery & Public House",
-        ],
     },
     {
+        "qid": "sushi-indianapolis",
         "query": "sushi Indianapolis",
         "category": "cuisine",
         "city": "indianapolis",
-        "relevant": [],
     },
+    #  Tucson
     {
+        "qid": "best-mexican-food-tucson",
         "query": "best Mexican food Tucson",
         "category": "cuisine",
         "city": "tucson",
-        "relevant": [
-            "Taqueria Pico De Gallo",
-            "El Guero Canelo",
-            "El Antojo Poblano",
-            "Taqueria El Pueblito",
-        ],
     },
     {
+        "qid": "brunch-tucson-arizona",
         "query": "brunch Tucson Arizona",
         "category": "mealtime",
         "city": "tucson",
-        "relevant": ["Prep & Pastry", "Cup Cafe", "47 Scott"],
     },
     {
+        "qid": "best-bbq-tucson",
         "query": "best BBQ Tucson",
         "category": "cuisine",
         "city": "tucson",
-        "relevant": [
-            "Kiss Of Smoke BBQ",
-            "Kens Hardwood Barbecue",
-            "Holy Smokin Butts BBQ",
-            "Smokey Mo",
-        ],
     },
     {
+        "qid": "romantic-dinner-tucson",
         "query": "romantic dinner Tucson",
         "category": "occasion",
         "city": "tucson",
-        "relevant": [],
     },
     {
+        "qid": "coffee-shops-tucson",
         "query": "coffee shops Tucson",
         "category": "type",
         "city": "tucson",
-        "relevant": [],
     },
+    #  Reno
     {
+        "qid": "best-breakfast-reno-nevada",
         "query": "best breakfast Reno Nevada",
         "category": "mealtime",
         "city": "reno",
-        "relevant": ["Peg's Glorified Ham n Eggs", "Squeeze In"],
     },
     {
+        "qid": "craft-beer-bars-reno",
         "query": "craft beer bars Reno",
         "category": "type",
         "city": "reno",
-        "relevant": ["The Brewer's Cabinet", "Bricks Restaurant & Bar"],
     },
     {
+        "qid": "romantic-dinner-reno",
         "query": "romantic dinner Reno",
         "category": "occasion",
         "city": "reno",
-        "relevant": ["Beaujolais Bistro"],
     },
     {
+        "qid": "best-tacos-reno-nv",
         "query": "best tacos Reno NV",
         "category": "cuisine+noisy",
         "city": "reno",
-        "relevant": [],
     },
+    #  Boise
     {
+        "qid": "best-brunch-boise-idaho",
         "query": "best brunch Boise Idaho",
         "category": "mealtime",
         "city": "boise",
-        "relevant": ["BACON", "Locavore", "The Chef's Hut", "Moon's Kitchen Cafe"],
     },
     {
+        "qid": "craft-beer-boise",
         "query": "craft beer Boise",
         "category": "type",
         "city": "boise",
-        "relevant": [
-            "Sockeye Brewing",
-            "EDGE Brewing Co",
-            "Highlands Hollow Brewhouse",
-            "Bier:Thirty Bottle & Bistro",
-        ],
     },
     {
+        "qid": "romantic-dinner-boise",
         "query": "romantic dinner Boise",
         "category": "occasion",
         "city": "boise",
-        "relevant": [],
     },
     {
+        "qid": "best-pizza-boise",
         "query": "best pizza Boise",
         "category": "cuisine",
         "city": "boise",
-        "relevant": [],
     },
+    #  Santa Barbara
     {
+        "qid": "romantic-dinner-santa-barbara",
         "query": "romantic dinner Santa Barbara",
         "category": "occasion",
         "city": "santa_barbara",
-        "relevant": ["Bouchon Santa Barbara", "The Lark", "Olio e Limone"],
     },
     {
+        "qid": "best-brunch-santa-barbara-california",
         "query": "best brunch Santa Barbara California",
         "category": "mealtime",
         "city": "santa_barbara",
-        "relevant": ["Scarlett Begonia", "Barbareno"],
     },
     {
+        "qid": "seafood-santa-barbara",
         "query": "seafood Santa Barbara",
         "category": "cuisine",
         "city": "santa_barbara",
-        "relevant": [],
     },
     {
+        "qid": "wine-bars-santa-barbara",
         "query": "wine bars Santa Barbara",
         "category": "type",
         "city": "santa_barbara",
-        "relevant": [],
     },
+    #  Edmonton
     {
+        "qid": "fine-dining-edmonton-alberta",
         "query": "fine dining Edmonton Alberta",
         "category": "occasion",
         "city": "edmonton",
-        "relevant": [
-            "The Workshop Eatery",
-            "Harvest Room",
-            "XIX Nineteen",
-            "Bistro Praha",
-            "Otto Food and Drink",
-        ],
     },
     {
+        "qid": "best-brunch-edmonton",
         "query": "best brunch Edmonton",
         "category": "mealtime",
         "city": "edmonton",
-        "relevant": ["Pip", "Little Brick", "OEB Breakfast", "Cafe Blackbird"],
     },
     {
+        "qid": "best-ramen-edmonton",
         "query": "best ramen Edmonton",
         "category": "cuisine",
         "city": "edmonton",
-        "relevant": [],
     },
     {
+        "qid": "pho-edmonton-canada",
         "query": "pho Edmonton Canada",
         "category": "cuisine",
         "city": "edmonton",
-        "relevant": [],
     },
+    #  Saint Louis
     {
+        "qid": "best-bbq-saint-louis",
         "query": "best BBQ Saint Louis",
         "category": "cuisine",
         "city": "saint_louis",
-        "relevant": ["Salt + Smoke", "Pappy's Smokehouse", "Bogart's Smokehouse"],
     },
     {
+        "qid": "romantic-dinner-st-louis-missouri",
         "query": "romantic dinner St Louis Missouri",
         "category": "occasion+noisy",
         "city": "saint_louis",
-        "relevant": [
-            "Bulrush STL",
-            "Polite Society",
-            "Bar Les Freres",
-            "The Piccadilly at Manhattan",
-        ],
     },
     {
+        "qid": "best-vietnamese-food-saint-louis",
         "query": "best Vietnamese food Saint Louis",
         "category": "cuisine",
         "city": "saint_louis",
-        "relevant": ["Mai Lee"],
     },
     {
+        "qid": "brunch-saint-louis",
         "query": "brunch Saint Louis",
         "category": "mealtime",
         "city": "saint_louis",
-        "relevant": [],
     },
+    #  Wilmington
     {
+        "qid": "best-restaurants-wilmington-delaware",
         "query": "best restaurants Wilmington Delaware",
         "category": "cuisine",
         "city": "wilmington",
-        "relevant": ["Iron Hill Brewery & Restaurant", "Columbus Inn", "Le Shio"],
     },
     {
+        "qid": "romantic-dinner-wilmington-de",
         "query": "romantic dinner Wilmington DE",
         "category": "occasion+noisy",
         "city": "wilmington",
-        "relevant": [
-            "La Fia",
-            "Green Room",
-            "Krazy Kat's Restaurant",
-            "Domaine Hudson",
-        ],
     },
     {
+        "qid": "brunch-wilmington",
         "query": "brunch Wilmington",
         "category": "mealtime",
         "city": "wilmington",
-        "relevant": [],
     },
+    #  No-city queries
     {
+        "qid": "cozy-coffee-shop-to-study",
         "query": "cozy coffee shop to study",
         "category": "ambiance",
         "city": None,
-        "relevant": [
-            "The Broad Street Grind",
-            "Chapterhouse Café & Gallery",
-            "Picasso's Coffee House",
-            "Kaffeine Coffee",
-        ],
     },
     {
+        "qid": "family-friendly-pizza-place",
         "query": "family friendly pizza place",
         "category": "occasion+cuisine",
         "city": None,
-        "relevant": ["Your Pie", "Little Anthony Pizza", "Uncle Maddios Pizza"],
     },
     {
+        "qid": "best-ramen-spots",
         "query": "best ramen spots",
         "category": "cuisine",
         "city": None,
-        "relevant": [
-            "Ramen House",
-            "Terakawa Ramen",
-            "Ramen Ray",
-            "Raijin Ramen",
-            "Uncommon Ramen",
-        ],
     },
     {
+        "qid": "spicy-food-lovers-restaurant",
         "query": "spicy food lovers restaurant",
         "category": "cuisine",
         "city": None,
-        "relevant": ["Spicy Affair", "Thai Spice", "Spice Indian Cuisine"],
     },
     {
+        "qid": "outdoor-seating-restaurants-with-dogs-allowed",
         "query": "outdoor seating restaurants with dogs allowed",
         "category": "ambiance+constraint",
         "city": None,
-        "relevant": [],
     },
     {
+        "qid": "halal-restaurants",
         "query": "halal restaurants",
         "category": "dietary",
         "city": None,
-        "relevant": [],
     },
     {
+        "qid": "upscale-steakhouse",
         "query": "upscale steakhouse",
         "category": "occasion+cuisine",
         "city": None,
-        "relevant": [
-            "KC Prime",
-            "Bern's Steak House",
-            "Cerise Craft Steakhouse",
-            "Morton's The Steakhouse",
-            "Perry's Steakhouse & Grille - Cool Springs",
-        ],
     },
 ]
 
+#  Relevance labels
 
-def mrr_at_k(results: List[Dict], relevant: set, k: int = 5) -> float:
+
+def load_qrels(path: Path = QRELS_PATH) -> Dict[str, Set[str]]:
+    """Returns {qid: set of relevant business_ids} from the qrels JSON."""
+    with open(path, encoding="utf-8") as f:
+        raw = json.load(f)
+    return {qid: set(ids) for qid, ids in raw.items()}
+
+
+def split_judged(
+    queries: List[Dict], qrels: Dict[str, Set[str]]
+) -> Tuple[List[Dict], List[Tuple[Dict, str]]]:
+    """Returns (queries with ≥1 relevant business, [(query, exclusion reason)])."""
+    scored, excluded = [], []
+    for q in queries:
+        if q["qid"] not in qrels:
+            excluded.append((q, "not judged"))
+        elif not qrels[q["qid"]]:
+            excluded.append((q, "0 relevant in pool"))
+        else:
+            scored.append(q)
+    return scored, excluded
+
+
+#  Metrics
+
+
+def _is_relevant(result: Dict, relevant: Set[str]) -> bool:
+    return result.get("business_id") in relevant
+
+
+def mrr_at_k(results: List[Dict], relevant: Set[str], k: int = 5) -> float:
     for i, r in enumerate(results[:k]):
-        if in_relevant(r, relevant):
+        if _is_relevant(r, relevant):
             return 1.0 / (i + 1)
     return 0.0
 
 
-def hit_at_k(results: List[Dict], relevant: set, k: int) -> float:
-    return float(any(in_relevant(r, relevant) for r in results[:k]))
+def hit_at_k(results: List[Dict], relevant: Set[str], k: int) -> float:
+    return float(any(_is_relevant(r, relevant) for r in results[:k]))
 
 
-def precision_at_k(results: List[Dict], relevant: set, k: int) -> float:
+def precision_at_k(results: List[Dict], relevant: Set[str], k: int) -> float:
+    """Returns relevant hits in the top k divided by k (not by len(results))."""
     if not results:
         return 0.0
-    hits = sum(1 for r in results[:k] if in_relevant(r, relevant))
+    hits = sum(1 for r in results[:k] if _is_relevant(r, relevant))
     return hits / k
+
+
+def percentile(values: List[float], p: float) -> float:
+    """Returns the nearest-rank percentile; p is in 0-100."""
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    rank = max(1, math.ceil(p / 100 * len(ordered)))
+    return ordered[rank - 1]
 
 
 def bootstrap_ci(
@@ -1004,165 +945,309 @@ def bootstrap_ci(
     return (means[lo_idx], means[min(hi_idx, n_boot - 1)])
 
 
-def retrieve(
-    url: str, query: str, top_k: int, do_rerank: bool
-) -> Tuple[List[Dict], float]:
-    t0 = time.perf_counter()
-    try:
-        resp = requests.post(
-            f"{url}/retrieve",
-            json={"query": query, "top_k": top_k, "do_rerank": do_rerank},
-            timeout=60,
-        )
-        resp.raise_for_status()
-        latency_ms = (time.perf_counter() - t0) * 1000
-        data = resp.json()
-        results = data if isinstance(data, list) else data.get("results", [])
-        return results, latency_ms
-    except Exception as e:
-        latency_ms = (time.perf_counter() - t0) * 1000
-        print(f"   retrieve failed: {e}")
-        return [], latency_ms
+def paired_bootstrap_ci(
+    a: List[float], b: List[float], n_boot: int = 5000, ci: float = 0.95
+) -> Tuple[float, float, float]:
+    """Returns (mean, lo, hi) of paired differences a - b, bootstrapped over queries."""
+    if len(a) != len(b):
+        raise ValueError("paired samples must have the same length")
+    diffs = [x - y for x, y in zip(a, b)]
+    if not diffs:
+        return (0.0, 0.0, 0.0)
+    lo, hi = bootstrap_ci(diffs, n_boot=n_boot, ci=ci)
+    return (sum(diffs) / len(diffs), lo, hi)
+
+
+def win_loss_tie(a: List[float], b: List[float]) -> Tuple[int, int, int]:
+    wins = sum(1 for x, y in zip(a, b) if x > y)
+    losses = sum(1 for x, y in zip(a, b) if x < y)
+    return wins, losses, len(a) - wins - losses
 
 
 def location_accuracy(
     results: List[Dict], expected_city: Optional[str]
 ) -> Optional[float]:
-
+    """Returns the fraction of results in expected_city's metro area, or None."""
     if expected_city is None or not results:
         return None
     metro_key = expected_city.lower()
-    metro_suburbs = set(METRO_AREAS.get(metro_key, [metro_key.replace("_", " ")]))
-
-    def city_matches(result_city: str) -> bool:
-        rc = result_city.lower().strip()
-        # Direct metro match
-        if rc == metro_key.replace("_", " "):
-            return True
-        # Suburb → metro lookup
-        return _SUBURB_TO_METRO.get(rc) == metro_key
-
-    matches = sum(1 for r in results if city_matches(r.get("city") or ""))
+    metro = _METRO_NORMALIZED.get(
+        metro_key, {normalize_city(metro_key.replace("_", " "))}
+    )
+    matches = sum(1 for r in results if normalize_city(r.get("city") or "") in metro)
     return matches / len(results)
 
 
-def evaluate(
+#  HTTP retrieval
+
+
+def retrieve(
     url: str,
-    top_k: int = 5,
+    query: str,
+    top_k: int,
+    do_rerank: bool,
+    k_rrf: int = config.RRF_K,
+    initial_k: int = config.INITIAL_K,
+    max_duplicates: int = config.MAX_DUPLICATES,
+    no_cache: bool = True,
+) -> Tuple[List[Dict], float, Optional[float], Dict]:
+    """Returns (results, client_ms, server_ms, response_body); server_ms is None on failure."""
+    payload = {
+        "query": query,
+        "top_k": top_k,
+        "do_rerank": do_rerank,
+        "k_rrf": k_rrf,
+        "initial_k": initial_k,
+        "max_duplicates": max_duplicates,
+        "no_cache": no_cache,
+    }
+    t0 = time.perf_counter()
+    try:
+        resp = requests.post(f"{url}/retrieve", json=payload, timeout=120)
+        resp.raise_for_status()
+        client_ms = (time.perf_counter() - t0) * 1000
+        data = resp.json()
+        if isinstance(data, list):
+            return data, client_ms, None, {}
+        return (
+            data.get("results", []),
+            client_ms,
+            float(data.get("retrieval_ms") or 0.0),
+            data,
+        )
+    except Exception as e:
+        client_ms = (time.perf_counter() - t0) * 1000
+        print(f"    ⚠ retrieve failed: {e}")
+        return [], client_ms, None, {}
+
+
+#  Main evaluator
+
+
+def run_eval(
+    url: str,
+    queries: List[Dict],
+    qrels: Dict[str, Set[str]],
+    strategies: List[Dict],
+    params: Dict,
     verbose: bool = False,
-    out: Optional[str] = None,
-    use_mlflow: bool = False,
-    mlflow_experiment: str = "dinerag-retrieval-eval",
-):
-    strategies = [
-        {"name": "Hybrid + Rerank", "do_rerank": True},
-        {"name": "Hybrid (no rerank)", "do_rerank": False},
-    ]
-
-    labeled = [q for q in TEST_QUERIES if q["relevant"]]
-    unlabeled = [q for q in TEST_QUERIES if not q["relevant"]]
-
-    print(f"\n{'='*72}")
-    print(f"  DineRAG Comprehensive Retrieval Evaluation")
-    print(f"{'='*72}")
-    print(f"  Retriever : {url}")
-    print(f"  top_k     : {top_k}")
-
-    print("  [warm-up] sending warm-up query...")
-    retrieve(url, "best pizza Philadelphia", top_k=top_k, do_rerank=True)
-    print("  [warm-up] done\n")
-
+) -> List[Dict]:
+    """Runs each query under each strategy; returns one record per (strategy, query)."""
+    top_k = params["top_k"]
     all_records = []
 
     for strat in strategies:
-        print(f"\n── Strategy: {strat['name']} {'─'*(50-len(strat['name']))}")
-
+        print(f"\n Strategy: {strat['name']}  (k_rrf={params['k_rrf']}) {''*20}")
         records = []
-        for i, test in enumerate(labeled):
+        for i, test in enumerate(queries):
             query = test["query"]
-            relevant = set(test["relevant"])
+            relevant = qrels[test["qid"]]
             exp_city = test.get("city")
-            category = test.get("category", "other")
 
-            results, latency = retrieve(
-                url, query, top_k=top_k, do_rerank=strat["do_rerank"]
+            results, client_ms, server_ms, body = retrieve(
+                url,
+                query,
+                top_k=top_k,
+                do_rerank=strat["do_rerank"],
+                k_rrf=params["k_rrf"],
+                initial_k=params["initial_k"],
+                max_duplicates=params["max_duplicates"],
+                no_cache=True,
             )
+            if results and not all(r.get("business_id") for r in results):
+                raise RuntimeError(
+                    "Retriever results have no business_id — the retriever at "
+                    f"{url} predates ID-based eval; restart it from current code."
+                )
 
             mrr = mrr_at_k(results, relevant, k=5)
-            h3 = hit_at_k(results, relevant, k=3)
-            h5 = hit_at_k(results, relevant, k=5)
-            p5 = precision_at_k(results, relevant, k=5)
-            loc_acc = location_accuracy(results, exp_city)
-
             record = {
+                "qid": test["qid"],
                 "query": query,
-                "category": category,
+                "category": test.get("category", "other"),
                 "city": exp_city,
                 "strategy": strat["name"],
+                **params,
+                "n_relevant": len(relevant),
                 "mrr5": mrr,
-                "hit3": h3,
-                "hit5": h5,
-                "p5": p5,
-                "loc_acc": loc_acc,
-                "latency": latency,
+                "hit3": hit_at_k(results, relevant, k=3),
+                "hit5": hit_at_k(results, relevant, k=5),
+                "p5": precision_at_k(results, relevant, k=5),
+                "loc_acc": location_accuracy(results, exp_city),
+                "latency_client_ms": client_ms,
+                "latency_server_ms": server_ms,
+                "error": server_ms is None,
+                "out_of_coverage": bool(body.get("out_of_coverage", False)),
                 "results": len(results),
                 "returned": [
-                    (r.get("restaurant") or r.get("name") or "?")
+                    {
+                        "business_id": r.get("business_id"),
+                        "restaurant": r.get("restaurant") or r.get("name") or "?",
+                        "city": r.get("city"),
+                        "relevant": _is_relevant(r, relevant),
+                    }
                     for r in results[:top_k]
                 ],
             }
             records.append(record)
 
-            status = "PASSED" if mrr > 0 else "FAILED"
+            status = "⚠" if record["error"] else ("✅" if mrr > 0 else "❌")
+            srv = f"{server_ms:.0f}ms" if server_ms is not None else "—"
             if verbose:
                 print(f"  {status} [{i+1:02d}] {query}")
-                loc_str = f"{loc_acc:.2f}" if loc_acc is not None else "N/A"
+                loc = record["loc_acc"]
                 print(
-                    f"       MRR@5={mrr:.3f}  Hit@5={h5:.0f}  P@5={p5:.3f}  loc={loc_str}  {latency:.0f}ms"
+                    f"       MRR@5={mrr:.3f}  Hit@5={record['hit5']:.0f}  P@5={record['p5']:.3f}  "
+                    f"loc={f'{loc:.2f}' if loc is not None else 'N/A'}  "
+                    f"client={client_ms:.0f}ms  server={srv}"
                 )
                 if mrr == 0 and results:
-                    names = ", ".join(
-                        r.get("restaurant") or r.get("name") or "?" for r in results[:3]
+                    print(
+                        f"       got: {', '.join(x['restaurant'] for x in record['returned'][:3])}"
                     )
-                    print(f"       got: {names}")
             else:
                 print(
-                    f"  {status} [{i+1:02d}/{len(labeled)}] {query[:55]:<55} MRR={mrr:.2f}  {latency:.0f}ms"
+                    f"  {status} [{i+1:02d}/{len(queries)}] {query[:55]:<55} "
+                    f"MRR={mrr:.2f}  {client_ms:.0f}ms (server {srv})"
                 )
 
             time.sleep(0.2)
 
         all_records.extend(records)
-        _print_strategy_summary(strat["name"], records, top_k)
-        if use_mlflow:
-            _log_to_mlflow(mlflow_experiment, strat["name"], records, url, top_k)
+        _print_strategy_summary(strat["name"], records)
 
-    if unlabeled:
-        print(f"\nRobustness pass {'─'*20}")
-        for test in unlabeled:
-            results, latency = retrieve(url, test["query"], top_k=top_k, do_rerank=True)
-            city_check = location_accuracy(results, test.get("city"))
-            has = bool(results)
-            print(
-                f"  {'PASSED' if has else 'FAILED'} {test['query']:<55} "
-                f"n={len(results)}  loc={f'{city_check:.2f}' if city_check is not None else 'N/A'}  {latency:.0f}ms"
-            )
-            if results and verbose:
-                names = ", ".join(
-                    r.get("restaurant") or r.get("name") or "?" for r in results[:3]
+    return all_records
+
+
+def evaluate(
+    url: str,
+    top_k: int = 5,
+    k_rrf: int = config.RRF_K,
+    initial_k: int = config.INITIAL_K,
+    max_duplicates: int = config.MAX_DUPLICATES,
+    sweep_rrf: Optional[List[int]] = None,
+    verbose: bool = False,
+    out: Optional[str] = None,
+    use_mlflow: bool = False,
+    mlflow_experiment: str = "dinerag-retrieval-eval",
+    qrels_path: Path = QRELS_PATH,
+) -> List[Dict]:
+    try:
+        qrels = load_qrels(qrels_path)
+    except FileNotFoundError:
+        print(
+            f"No relevance labels at {qrels_path}.\n"
+            "Build them first:\n"
+            "  python ml_backend/eval_labels.py pool --url <retriever>   # writes eval_data/label_pool.csv\n"
+            "  (fill the `relevant` column with y/n)\n"
+            "  python ml_backend/eval_labels.py import                    # writes eval_data/qrels.json",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    qrels_sha = hashlib.sha256(Path(qrels_path).read_bytes()).hexdigest()[:12]
+
+    scored, excluded = split_judged(TEST_QUERIES, qrels)
+
+    print(f"\n{'='*72}")
+    print("  DineRAG Retrieval Evaluation")
+    print(f"{'='*72}")
+    print(f"  Retriever : {url}")
+    print(
+        f"  top_k={top_k}  initial_k={initial_k}  max_duplicates={max_duplicates}  "
+        f"k_rrf={'sweep ' + ','.join(map(str, sweep_rrf)) if sweep_rrf else k_rrf}"
+    )
+    print(
+        f"  Labels    : {qrels_path.name} (sha {qrels_sha}) — pooled top-10, judged by hand, "
+        f"matched on business_id"
+    )
+    print(f"  Scored    : {len(scored)} / {len(TEST_QUERIES)} queries")
+    if excluded:
+        print(f"  Excluded  : {len(excluded)}")
+        for q, reason in excluded:
+            print(f"     - [{reason}] {q['query']}")
+    print("  Cache     : bypassed (no_cache=True) — latencies are real retrievals")
+    print(f"{'='*72}\n")
+
+    if not scored:
+        print("  Nothing to score.")
+        return []
+
+    print("  [warm-up] sending warm-up query...")
+    retrieve(url, "best pizza Philadelphia", top_k=top_k, do_rerank=True, no_cache=True)
+    print("  [warm-up] done\n")
+
+    base_params = {
+        "top_k": top_k,
+        "initial_k": initial_k,
+        "max_duplicates": max_duplicates,
+    }
+    meta = {
+        "retriever_url": url,
+        "qrels_sha": qrels_sha,
+        "n_queries": len(scored),
+        "n_excluded": len(excluded),
+    }
+
+    if sweep_rrf:
+
+        strategies = [s for s in STRATEGIES if not s["do_rerank"]]
+        print(
+            "  Sweep note: k_rrf only affects fused order, which the reranker "
+            "fully re-sorts, so only the no-rerank strategy is swept.\n"
+        )
+        all_records = []
+        for k in sweep_rrf:
+            params = {**base_params, "k_rrf": k}
+            recs = run_eval(url, scored, qrels, strategies, params, verbose)
+            all_records.extend(recs)
+            if use_mlflow:
+                _log_to_mlflow(
+                    mlflow_experiment,
+                    f"{strategies[0]['name']} k_rrf={k}",
+                    recs,
+                    params,
+                    meta,
                 )
-                print(f"     → {names}")
-            time.sleep(0.2)
+        _print_sweep(all_records, sweep_rrf, strategies[0]["name"])
+    else:
+        params = {**base_params, "k_rrf": k_rrf}
+        all_records = run_eval(url, scored, qrels, STRATEGIES, params, verbose)
+        paired = _paired_stats(
+            all_records, STRATEGIES[0]["name"], STRATEGIES[1]["name"]
+        )
+        _print_comparison(all_records, STRATEGIES, paired)
+        _print_per_city(all_records, STRATEGIES[0]["name"])
+        _print_per_category(all_records, STRATEGIES[0]["name"])
+        _print_failures(all_records, STRATEGIES[0]["name"])
+        if use_mlflow:
+            for strat in STRATEGIES:
+                recs = [r for r in all_records if r["strategy"] == strat["name"]]
+                _log_to_mlflow(
+                    mlflow_experiment,
+                    strat["name"],
+                    recs,
+                    params,
+                    meta,
+                    paired=paired if strat is STRATEGIES[0] else None,
+                )
 
-    _print_comparison(all_records, strategies)
-    _print_per_city(all_records, strategies[0]["name"])
-    _print_per_category(all_records, strategies[0]["name"])
-    _print_failures(all_records, strategies[0]["name"])
+    n_err = sum(1 for r in all_records if r["error"])
+    if n_err:
+        print(
+            f"\n  ⚠ {n_err} request(s) failed and were scored as misses — check the retriever."
+        )
 
     if out:
-        with open(out, "w") as f:
-            json.dump(all_records, f, indent=2)
+        with open(out, "w", encoding="utf-8") as f:
+            json.dump(
+                {"meta": {**meta, **base_params}, "records": all_records}, f, indent=2
+            )
         print(f"\n  Results written to: {out}")
+
+    return all_records
+
+
+#  Helpers
 
 
 def _agg(records: List[Dict], key: str):
@@ -1173,32 +1258,72 @@ def _mean(vals):
     return sum(vals) / len(vals) if vals else 0.0
 
 
+def _latency_stats(records: List[Dict], key: str) -> Dict[str, float]:
+    vals = [r[key] for r in records if not r["error"] and r[key] is not None]
+    return {
+        "mean": _mean(vals),
+        "p50": percentile(vals, 50),
+        "p95": percentile(vals, 95),
+    }
+
+
+def _paired_stats(records: List[Dict], a_name: str, b_name: str) -> Optional[Dict]:
+    """Returns per-query ΔMRR@5 stats of strategy a over b, or None if no shared queries."""
+    a = {r["qid"]: r["mrr5"] for r in records if r["strategy"] == a_name}
+    b = {r["qid"]: r["mrr5"] for r in records if r["strategy"] == b_name}
+    qids = [q for q in a if q in b]
+    if not qids:
+        return None
+    av, bv = [a[q] for q in qids], [b[q] for q in qids]
+    delta, lo, hi = paired_bootstrap_ci(av, bv)
+    w, l, t = win_loss_tie(av, bv)
+    return {
+        "a": a_name,
+        "b": b_name,
+        "n": len(qids),
+        "delta_mrr5": delta,
+        "ci_low": lo,
+        "ci_high": hi,
+        "wins": w,
+        "losses": l,
+        "ties": t,
+    }
+
+
 def _log_to_mlflow(
-    experiment: str, strategy: str, records: List[Dict], url: str, top_k: int
+    experiment: str,
+    run_name: str,
+    records: List[Dict],
+    params: Dict,
+    meta: Dict,
+    paired: Optional[Dict] = None,
 ) -> None:
+    """Logs one MLflow run; params are the values sent to /retrieve, not config defaults."""
     import mlflow
 
     if "MLFLOW_TRACKING_URI" not in os.environ:
-        mlruns_dir = Path(__file__).resolve().parent.parent / "mlruns"
+        mlruns_dir = Path(_REPO_ROOT) / "mlruns"
         mlruns_dir.mkdir(exist_ok=True)
         db_path = (mlruns_dir / "mlflow.db").as_posix()
         mlflow.set_tracking_uri(f"sqlite:///{db_path}")
 
     mlflow.set_experiment(experiment)
-    with mlflow.start_run(run_name=strategy):
-        mlflow.log_params({
-            "strategy": strategy,
-            "retriever_url": url,
-            "top_k": top_k,
-            "rrf_k": config.RRF_K,
-            "initial_k": config.INITIAL_K,
-            "max_duplicates": config.MAX_DUPLICATES,
-            "n_queries": len(records),
-        })
+    with mlflow.start_run(run_name=run_name):
+        mlflow.log_params(
+            {
+                "strategy": records[0]["strategy"] if records else run_name,
+                "no_cache": True,
+                "label_source": "pooled-manual-business_id",
+                **params,
+                **meta,
+            }
+        )
         mrr_vals = _agg(records, "mrr5")
         ci = bootstrap_ci(mrr_vals)
-        loc_vals = [r["loc_acc"] for r in records if r["loc_acc"] is not None]
-        mlflow.log_metrics({
+        loc_vals = _agg(records, "loc_acc")
+        client = _latency_stats(records, "latency_client_ms")
+        server = _latency_stats(records, "latency_server_ms")
+        metrics = {
             "mrr5": _mean(mrr_vals),
             "mrr5_ci_low": ci[0],
             "mrr5_ci_high": ci[1],
@@ -1206,57 +1331,76 @@ def _log_to_mlflow(
             "hit5": _mean(_agg(records, "hit5")),
             "p5": _mean(_agg(records, "p5")),
             "loc_acc": _mean(loc_vals) if loc_vals else 0.0,
-            "avg_latency_ms": _mean(_agg(records, "latency")),
-        })
+            "latency_client_mean_ms": client["mean"],
+            "latency_client_p50_ms": client["p50"],
+            "latency_client_p95_ms": client["p95"],
+            "latency_server_mean_ms": server["mean"],
+            "latency_server_p50_ms": server["p50"],
+            "latency_server_p95_ms": server["p95"],
+            "n_errors": sum(1 for r in records if r["error"]),
+        }
+        if paired:
+            mlflow.log_param("paired_baseline", paired["b"])
+            metrics.update(
+                {
+                    "paired_delta_mrr5": paired["delta_mrr5"],
+                    "paired_delta_mrr5_ci_low": paired["ci_low"],
+                    "paired_delta_mrr5_ci_high": paired["ci_high"],
+                    "paired_wins": paired["wins"],
+                    "paired_losses": paired["losses"],
+                    "paired_ties": paired["ties"],
+                }
+            )
+        mlflow.log_metrics(metrics)
 
 
-def _print_strategy_summary(name: str, records: List[Dict], top_k: int):
+def _print_strategy_summary(name: str, records: List[Dict]):
     mrr_vals = _agg(records, "mrr5")
-    hit3_vals = _agg(records, "hit3")
-    hit5_vals = _agg(records, "hit5")
-    p5_vals = _agg(records, "p5")
-    lat_vals = _agg(records, "latency")
-    loc_vals = [r["loc_acc"] for r in records if r["loc_acc"] is not None]
-
+    loc_vals = _agg(records, "loc_acc")
     mrr_ci = bootstrap_ci(mrr_vals)
-    n = len(mrr_vals)
+    client = _latency_stats(records, "latency_client_ms")
+    server = _latency_stats(records, "latency_server_ms")
 
-    print(f"\n  Summary ({name}, n={n}):")
+    print(f"\n  Summary ({name}, n={len(mrr_vals)}):")
     print(
         f"    MRR@5  : {_mean(mrr_vals):.3f}  95% CI [{mrr_ci[0]:.3f}, {mrr_ci[1]:.3f}]"
     )
-    print(f"    Hit@3  : {_mean(hit3_vals):.3f}")
-    print(f"    Hit@5  : {_mean(hit5_vals):.3f}")
-    print(f"    P@5    : {_mean(p5_vals):.3f}  (denominator=k, not len(results))")
-    print(f"    Loc acc: {_mean(loc_vals):.3f}  (metro-area aware)")
-    if lat_vals:
-        p95_idx = int(0.95 * len(lat_vals))
-        print(
-            f"    Latency: {_mean(lat_vals):.0f}ms avg  |  p95={sorted(lat_vals)[p95_idx]:.0f}ms"
-        )
+    print(f"    Hit@3  : {_mean(_agg(records, 'hit3')):.3f}")
+    print(f"    Hit@5  : {_mean(_agg(records, 'hit5')):.3f}")
+    print(f"    P@5    : {_mean(_agg(records, 'p5')):.3f}  (denominator=k)")
+    print(
+        f"    Loc acc: {_mean(loc_vals):.3f}  (city-filter sanity check, not a quality metric)"
+    )
+    print(
+        f"    Latency: client {client['mean']:.0f}ms mean | p50 {client['p50']:.0f} | p95 {client['p95']:.0f}"
+        f"   server {server['mean']:.0f}ms mean | p50 {server['p50']:.0f} | p95 {server['p95']:.0f}"
+    )
 
 
-def _print_comparison(records: List[Dict], strategies: List[Dict]):
+def _print_comparison(
+    records: List[Dict], strategies: List[Dict], paired: Optional[Dict]
+):
     print(f"\n\n{'='*72}")
     print("  STRATEGY COMPARISON")
     print(f"{'='*72}\n")
     rows = []
     for strat in strategies:
-        sname = strat["name"]
-        r = [x for x in records if x["strategy"] == sname]
+        r = [x for x in records if x["strategy"] == strat["name"]]
         if not r:
             continue
         mrr_vals = _agg(r, "mrr5")
         ci = bootstrap_ci(mrr_vals)
+        client = _latency_stats(r, "latency_client_ms")
         rows.append(
             [
-                sname,
+                strat["name"],
                 f"{_mean(mrr_vals):.3f}",
                 f"[{ci[0]:.3f}, {ci[1]:.3f}]",
                 f"{_mean(_agg(r, 'hit3')):.3f}",
                 f"{_mean(_agg(r, 'hit5')):.3f}",
                 f"{_mean(_agg(r, 'p5')):.3f}",
-                f"{_mean(_agg(r, 'latency')):.0f}ms",
+                f"{client['mean']:.0f}ms",
+                f"{client['p95']:.0f}ms",
                 len(mrr_vals),
             ]
         )
@@ -1270,8 +1414,61 @@ def _print_comparison(records: List[Dict], strategies: List[Dict]):
                 "Hit@3",
                 "Hit@5",
                 "P@5",
-                "Avg Lat",
+                "Mean Lat",
+                "p95 Lat",
                 "n",
+            ],
+            tablefmt="rounded_outline",
+        )
+    )
+    if paired:
+        print(
+            f"\n  Paired ΔMRR@5 ({paired['a']} − {paired['b']}, n={paired['n']}): "
+            f"{paired['delta_mrr5']:+.3f}  95% CI [{paired['ci_low']:+.3f}, {paired['ci_high']:+.3f}]"
+        )
+        print(
+            f"  Per-query W/L/T: {paired['wins']}/{paired['losses']}/{paired['ties']}"
+        )
+        if paired["ci_low"] <= 0 <= paired["ci_high"]:
+            print("  → CI includes 0: no significant difference at this sample size.")
+
+
+def _print_sweep(records: List[Dict], ks: List[int], strategy: str):
+    print(f"\n\n{'='*72}")
+    print(f"  RRF k SWEEP  ({strategy})")
+    print(f"{'='*72}\n")
+    baseline = config.RRF_K if config.RRF_K in ks else ks[0]
+    base = {r["qid"]: r["mrr5"] for r in records if r["k_rrf"] == baseline}
+    rows = []
+    for k in ks:
+        r = [x for x in records if x["k_rrf"] == k]
+        mrr_vals = _agg(r, "mrr5")
+        ci = bootstrap_ci(mrr_vals)
+        cur = {x["qid"]: x["mrr5"] for x in r}
+        qids = [q for q in cur if q in base]
+        delta, lo, hi = paired_bootstrap_ci(
+            [cur[q] for q in qids], [base[q] for q in qids]
+        )
+        rows.append(
+            [
+                k,
+                f"{_mean(mrr_vals):.3f}",
+                f"[{ci[0]:.3f}, {ci[1]:.3f}]",
+                f"{_mean(_agg(r, 'hit5')):.3f}",
+                f"{_mean(_agg(r, 'p5')):.3f}",
+                "—" if k == baseline else f"{delta:+.3f} [{lo:+.3f}, {hi:+.3f}]",
+            ]
+        )
+    print(
+        tabulate(
+            rows,
+            headers=[
+                "k_rrf",
+                "MRR@5",
+                "95% CI",
+                "Hit@5",
+                "P@5",
+                f"ΔMRR vs k={baseline} (paired CI)",
             ],
             tablefmt="rounded_outline",
         )
@@ -1280,7 +1477,7 @@ def _print_comparison(records: List[Dict], strategies: List[Dict]):
 
 def _print_per_city(records: List[Dict], strategy: str):
     print(f"\n\n{'='*72}")
-    print(f"  PER-CITY BREAKDOWN  ({strategy})")
+    print(f"  PER-CITY BREAKDOWN  ({strategy})  — small n per row; indicative only")
     print(f"{'='*72}\n")
     r = [x for x in records if x["strategy"] == strategy]
     cities = sorted(set(x["city"] for x in r if x["city"]))
@@ -1288,7 +1485,7 @@ def _print_per_city(records: List[Dict], strategy: str):
     for city in cities:
         cr = [x for x in r if x["city"] == city]
         mrr_vals = _agg(cr, "mrr5")
-        loc_vals = [x["loc_acc"] for x in cr if x["loc_acc"] is not None]
+        loc_vals = _agg(cr, "loc_acc")
         rows.append(
             [
                 city.replace("_", " ").title(),
@@ -1311,7 +1508,7 @@ def _print_per_city(records: List[Dict], strategy: str):
 
 def _print_per_category(records: List[Dict], strategy: str):
     print(f"\n\n{'='*72}")
-    print(f"  PER-CATEGORY BREAKDOWN  ({strategy})")
+    print(f"  PER-CATEGORY BREAKDOWN  ({strategy})  — small n per row; indicative only")
     print(f"{'='*72}\n")
     r = [x for x in records if x["strategy"] == strategy]
 
@@ -1345,46 +1542,75 @@ def _print_per_category(records: List[Dict], strategy: str):
 def _print_failures(records: List[Dict], strategy: str):
     failures = [x for x in records if x["strategy"] == strategy and x["mrr5"] == 0.0]
     if not failures:
-        print("\n  No zero-MRR queries. PASSED cleanly)")
+        print("\n  No zero-MRR queries. ✅")
         return
     print(f"\n\n{'='*72}")
     print(f"  FAILURE ANALYSIS — {len(failures)} zero-MRR queries  ({strategy})")
     print(f"{'='*72}\n")
     for f in failures:
-        print(f"  FAILED [{f['city'] or 'no-city'}]  {f['query']}")
+        print(f"  ❌ [{f['city'] or 'no-city'}]  {f['query']}")
         if f["returned"]:
-            print(f"     got: {', '.join(f['returned'][:3])}")
+            print(f"     got: {', '.join(x['restaurant'] for x in f['returned'][:3])}")
         else:
-            print(f"     got: (no results)")
+            print("     got: (no results)")
+
+
+#  Entry point
+
+
+def _int_list(s: str) -> List[int]:
+    return [int(x) for x in s.split(",") if x.strip()]
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="DineRAG Comprehensive Retrieval Evaluator"
-    )
+    parser = argparse.ArgumentParser(description="DineRAG Retrieval Evaluator")
     parser.add_argument(
         "--url",
-        default="https://megumind6172--food-rag-retriever-serve.modal.run",
-        help="Retriever base URL",
+        default="http://127.0.0.1:8000",
+        help="Retriever base URL (defaults to a local retriever, not production).",
     )
     parser.add_argument("--top_k", type=int, default=5)
-    parser.add_argument("--verbose", action="store_true")
-    parser.add_argument("--out", type=str, default=None)
+    parser.add_argument("--rrf-k", type=int, default=config.RRF_K)
+    parser.add_argument("--initial-k", type=int, default=config.INITIAL_K)
+    parser.add_argument("--max-duplicates", type=int, default=config.MAX_DUPLICATES)
     parser.add_argument(
-        "--mlflow", action="store_true",
-        help="Log per-strategy metrics to MLflow (local ./mlruns by default; "
-             "set MLFLOW_TRACKING_URI to point elsewhere).",
+        "--sweep-rrf",
+        type=_int_list,
+        default=None,
+        help="Comma-separated k_rrf values to sweep, e.g. 10,30,60,100,150 "
+        "(no-rerank strategy only; one MLflow run per value).",
+    )
+    parser.add_argument("--qrels", type=Path, default=QRELS_PATH)
+    parser.add_argument("--verbose", action="store_true")
+    parser.add_argument(
+        "--out",
+        type=str,
+        default=None,
+        help="Write per-query records (incl. returned business_ids) as JSON.",
     )
     parser.add_argument(
-        "--mlflow-experiment", type=str, default="dinerag-retrieval-eval",
+        "--mlflow",
+        action="store_true",
+        help="Log per-strategy metrics to MLflow (local ./mlruns by default; "
+        "set MLFLOW_TRACKING_URI to point elsewhere).",
+    )
+    parser.add_argument(
+        "--mlflow-experiment",
+        type=str,
+        default="dinerag-retrieval-eval",
     )
     args = parser.parse_args()
 
     evaluate(
         url=args.url,
         top_k=args.top_k,
+        k_rrf=args.rrf_k,
+        initial_k=args.initial_k,
+        max_duplicates=args.max_duplicates,
+        sweep_rrf=args.sweep_rrf,
         verbose=args.verbose,
         out=args.out,
         use_mlflow=args.mlflow,
         mlflow_experiment=args.mlflow_experiment,
+        qrels_path=args.qrels,
     )
