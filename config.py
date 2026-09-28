@@ -78,17 +78,38 @@ CHUNK_MAX_TOKENS = 480
 CHUNK_MIN_TOKENS = 50
 OVERHEAD_TOKENS = 4
 
+# Matches "in <Location>", stopping at common conjunctions and punctuation.
+LOCATION_PATTERN = (
+    r"\bin\s+([A-Za-z][a-zA-Z\s]{1,30}?)"
+    r"(?:\s+with|\s+for|\s+and|\s+near|\s+that|\s+where|\s+which|\s*[,$.]|$)"
+)
+
 # External Services
 RETRIEVER_URL = os.environ.get("RETRIEVER_URL")
 
+# Generation provider fallback order, used for both intent classification
+# and answer streaming. Override with the GENERATION_PROVIDER_ORDER env var
+# (comma-separated, e.g. "groq,claude").
+GENERATION_PROVIDER_ORDER = [
+    p.strip()
+    for p in os.getenv("GENERATION_PROVIDER_ORDER", "claude,groq").split(",")
+    if p.strip()
+]
+
 # Groq Configuration
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-GROQ_MODEL_ID = "qwen/qwen3-32b"
-GROQ_INTENT_MODEL = "llama-3.1-8b-instant"
+GROQ_MODEL_ID = "openai/gpt-oss-20b"
+GROQ_INTENT_MODEL = "openai/gpt-oss-20b"
 
-# Model Configuration
+# Claude (Anthropic) Configuration
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+CLAUDE_MODEL_ID = "claude-haiku-4-5"
+CLAUDE_INTENT_MODEL = "claude-haiku-4-5"
+CLAUDE_MAX_TOKENS = 1024
+
+# Local Model Configuration
 MODEL_ID = "Qwen/Qwen2.5-3B-Instruct"
-MAX_NEW_TOKENS = 700
+MAX_NEW_TOKENS = 800
 TEMPERATURE = 0.2
 TOP_P = 0.7
 TRIM_LENGTH = 350
@@ -106,16 +127,18 @@ GROQ_SYSTEM_PROMPT = (
     "You are DineRAG, a knowledgeable and helpful local food recommendation guide on the Yelp restaurant dataset.\n\n"
     "Use ONLY the provided context. Do not rely on outside knowledge. Do NOT invent restaurants, dishes, prices, or locations.\n"
     "Write with warmth and specific detail pulled from the reviews — atmosphere, a standout dish, a recurring compliment —"
-    " like a knowledgeable local friend giving advice. Keep it tight: a couple of sentences per point, not a full paragraph.\n\n"
+    " Sound like a knowledgeable local, but never infer facts beyond the reviews.. Keep it tight: a couple of sentences per point, not a full paragraph.\n\n"
     "For each recommendation use this template:\n\n"
     "**Restaurant Name** 📍 *address, city*\n\n"
-    "🍽️ [2-3 sentences: what makes this place the right answer for THIS specific query. "
-    "Pull concrete details from the reviews. Never use the phrase 'why it fits' or any generic filler.]\n\n"
-    "🌟 **Must-try:** [specific dishes or features from the reviews and exactly why reviewers love it]\n\n"
+    "🍽️ [3-5 sentences: what makes this place the right answer for THIS specific query. "
+    "Use all provided context(reviews + structured metadata). Never use the phrase 'why it fits' or any generic filler.\n\n"
+    "🌟 **Must-try:** If reviews mention standout dishes, include Must-try. Otherwise mention a standout feature.\n\n"
     "💡 *Tip:* [actionable tips a local would actually give — best time to go, what to order first, what to skip etc]\n\n"
     "There MUST be a blank line between the description and the tip.\n\n"
-    "Keep the whole response under ~500 words so multi-restaurant answers don't run out of room mid-sentence."
+    "Keep per restaurant response under 200 words."
+    "Present restaurants in retrieval order unless the user requested ranking."
     " Cover all spots without repeating yourself.\n\n"
+    "Avoid absolute language Instead of Best tacos in Tampa prefer Frequently praised for tacos."
     "Always read the user query carefully and respect the constraints:\n"
     "   - Health conditions or discomfort → recommend "
     "light, fresh, easy-to-digest options. Skip restaurants with negative reviews or heavy/greasy/spicy food.\n"

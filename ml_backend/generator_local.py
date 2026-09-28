@@ -36,7 +36,7 @@ _gen_lock = asyncio.Semaphore(1)
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
-from observability import (
+from ml_backend.observability import (
     setup_logging,
     attach_prometheus,
     Timer,
@@ -54,7 +54,7 @@ class RAGGenerator:
         self.device = config.GEN_DEVICE
 
     def load_model_qwen(self):
-        """Loads the quantized model into memory."""
+        """Loads the tokenizer and 4-bit quantized config.MODEL_ID onto self.device."""
         logger.info(f"[Generator] Loading model: {config.MODEL_ID} on {self.device}...")
 
         try:
@@ -83,7 +83,7 @@ class RAGGenerator:
     def _build_prompt_qwen(
         self, query: str, context_snippets: List[Dict[str, Any]]
     ) -> torch.Tensor:
-        """Constructs the system and user prompts using retrieved context."""
+        """Returns the tokenized chat-template inputs for query and context_snippets."""
 
         context_text_list = []
         for res in context_snippets:
@@ -126,7 +126,7 @@ class RAGGenerator:
     def generate_stream_qwen(
         self, query: str, context_snippets: List[Dict[str, Any]]
     ) -> Generator[str, None, None]:
-        """Streams tokens from the LLM in a separate thread."""
+        """Yields text chunks from model.generate running in a background thread."""
 
         gc.collect()
         if torch.cuda.is_available():
@@ -179,8 +179,7 @@ class RAGGenerator:
             if total + len(text) > max_chars:
                 break
 
-            s["text"] = text
-            trimmed.append(s)
+            trimmed.append({**s, "text": text})
             total += len(text)
 
         return trimmed
@@ -245,6 +244,7 @@ def is_out_of_coverage(query: str) -> bool:
 
 
 def _safe_excerpt(text: Optional[str], max_len: int = 400) -> str:
+    """Returns the text after the first "--" (or all of it), truncated to max_len."""
     if not text:
         return ""
     parts = text.split("--")
@@ -252,7 +252,7 @@ def _safe_excerpt(text: Optional[str], max_len: int = 400) -> str:
 
 
 async def fetch_context(query: str, top_k: int) -> List[Dict[str, Any]]:
-    """Calls the separate Retriever Microservice."""
+    """Queries the retriever service; returns (results, retrieval_ms), ([], 0.0) on HTTP errors."""
 
     try:
         payload = {"query": query, "top_k": top_k, "do_rerank": config.DO_RERANK}
@@ -286,6 +286,27 @@ async def fetch_context(query: str, top_k: int) -> List[Dict[str, Any]]:
         return [], 0.0
 
 
+def _early_stream(message: str, ndjson_extra_newline: bool = False) -> StreamingResponse:
+    """Returns an NDJSON stream (meta, empty sources, one token frame) replying with message.
+
+    Used for replies that skip retrieval. ndjson_extra_newline ends the token frame with "\\n\\n".
+    """
+
+    def stream():
+        yield json.dumps(
+            {"type": "meta", "data": {"retrieval_ms": 0, "results_count": 0, "reranked": False}}
+        ) + "\n"
+        yield json.dumps({"type": "sources", "data": []}) + "\n"
+        tail = "\n\n" if ndjson_extra_newline else "\n"
+        yield json.dumps({"type": "token", "data": message}) + tail
+
+    return StreamingResponse(
+        stream(),
+        media_type="application/x-ndjson",
+        headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
+    )
+
+
 @app.get("/health")
 def health_check():
     generator = gen_state.get("generator")
@@ -309,77 +330,10 @@ async def generate_endpoint(req: GenerateRequest):
     logger.info(f"[generate_endpoint] full_query: '{full_query}'")
 
     if is_non_food_query(req.query):
-
-        def greeting_stream():
-            yield json.dumps(
-                {
-                    "type": "meta",
-                    "data": {
-                        "retrieval_ms": 0,
-                        "results_count": 0,
-                        "reranked": False,
-                    },
-                }
-            ) + "\n"
-            yield json.dumps({"type": "sources", "data": []}) + "\n"
-            yield json.dumps(
-                {
-                    "type": "token",
-                    "data": (
-                        "Hi! I'm DineRAG, a restaurant recommendation assistant powered by real Yelp reviews 🍽️\n\n"
-                        "Try asking:\n"
-                        "- *Best tacos in Philadelphia*\n"
-                        "- *Romantic Italian dinner in Nashville*\n"
-                        "- *Late night ramen in Tampa*\n"
-                        "- *Casual Indian restaurant in Pennsylvania*\n\n"
-                        "I cover cities across: \n"
-                        "📍 **Pennsylvania** — Philadelphia, King of Prussia, Norristown, Doylestown (PA)\n"
-                        "📍 **California** — Santa Barbara, Goleta, Montecito, Carpinteria (CA)\n"
-                        "📍 **New Jersey** — Cherry Hill, Camden, Voorhees, Haddonfield (NJ)\n"
-                        "📍 **Florida** — Tampa, Clearwater, St. Petersburg, Brandon (FL)\n"
-                        "📍 **Tennessee** — Nashville, Brentwood, Franklin, Hendersonville (TN)\n"
-                        "📍 **Louisiana** — New Orleans, Metairie, Kenner, Chalmette (LA)\n"
-                        "📍 **Indiana** — Indianapolis, Carmel, Fishers, Noblesville (IN)\n"
-                        "📍 **Arizona** — Tucson, Oro Valley, Marana, Sahuarita (AZ)\n"
-                        "📍 **Nevada** — Reno (NV)\n"
-                        "📍 **Idaho** — Boise, Meridian, Eagle (ID)\n"
-                        "📍 **Illinois** — Belleville, Collinsville, Mascoutah, Caseyville (IL)\n"
-                        "📍 **Missouri** — Saint Louis, Chesterfield, Ballwin, Creve Coeur (MO)\n"
-                        "📍 **Delaware** — Wilmington, Claymont, Christiana (DE)\n"
-                        "📍 **Alberta** — Edmonton (AB)\n"
-                    ),
-                }
-            ) + "\n" + "\n"
-
-        return StreamingResponse(
-            greeting_stream(),
-            media_type="application/x-ndjson",
-            headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
-        )
+        return _early_stream(config.INTENT_RESPONSE_MAP["greeting"], ndjson_extra_newline=True)
 
     if is_out_of_coverage(req.query):
-
-        def coverage_stream():
-            yield json.dumps(
-                {
-                    "type": "meta",
-                    "data": {
-                        "retrieval_ms": 0,
-                        "results_count": 0,
-                        "reranked": False,
-                    },
-                }
-            ) + "\n"
-            yield json.dumps({"type": "sources", "data": []}) + "\n"
-            yield json.dumps(
-                {"type": "token", "data": config.COVERAGE_MESSAGE}
-            ) + "\n"
-
-        return StreamingResponse(
-            coverage_stream(),
-            media_type="application/x-ndjson",
-            headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
-        )
+        return _early_stream(config.COVERAGE_MESSAGE)
 
     context_results, retrieval_ms = await fetch_context(full_query, req.top_k)
 
@@ -426,23 +380,26 @@ async def generate_endpoint(req: GenerateRequest):
             QUERY_COUNTER.labels("generator", "no_results").inc()
             return
 
-        try:
-            async with _gen_lock:
+        # The lock is held for the generation call itself, so concurrent
+        # requests are serialized through the single local GPU model.
+        async with _gen_lock:
+            try:
                 for token in generator.generate_stream_qwen(req.query, context_results):
                     yield json.dumps({"type": "token", "data": token}) + "\n"
-            QUERY_COUNTER.labels("generator", "remove success").inc()
-        except RateLimitError:
-            yield json.dumps(
-                {"type": "error", "data": "Rate limit hit — try again shortly."}
-            ) + "\n"
-            QUERY_COUNTER.labels("generator", "rate_limit").inc()
-        except APIError as e:
-            yield json.dumps({"type": "error", "data": f"API error: {e}"}) + "\n"
-            QUERY_COUNTER.labels("generator", "error").inc()
-        except Exception as e:
-            logger.error(f"Generation error: {e}")
-            yield json.dumps({"type": "error", "data": str(e)}) + "\n"
-            QUERY_COUNTER.labels("generator", "error").inc()
+                    await asyncio.sleep(0)
+                QUERY_COUNTER.labels("generator", "success").inc()
+            except RateLimitError:
+                yield json.dumps(
+                    {"type": "error", "data": "Rate limit hit — try again shortly."}
+                ) + "\n"
+                QUERY_COUNTER.labels("generator", "rate_limit").inc()
+            except APIError as e:
+                yield json.dumps({"type": "error", "data": f"API error: {e}"}) + "\n"
+                QUERY_COUNTER.labels("generator", "error").inc()
+            except Exception as e:
+                logger.error(f"Generation error: {e}")
+                yield json.dumps({"type": "error", "data": str(e)}) + "\n"
+                QUERY_COUNTER.labels("generator", "error").inc()
 
     return StreamingResponse(
         response_stream(),
