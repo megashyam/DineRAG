@@ -35,6 +35,8 @@ groq==1.2.0
 anthropic==1.1.0
 diskcache==5.6.3
 wrapt==2.1.2
+# MCP server (ml_backend/mcp_server.py). 2.x renamed FastMCP to MCPServer.
+mcp==2.2.0
 
 # Observability
 loguru==0.7.3
