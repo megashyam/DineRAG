@@ -3,6 +3,7 @@ from http import client
 import os
 
 import pickle
+import re
 import string
 import time
 import numpy as np
@@ -12,7 +13,7 @@ import torch
 from typing import Optional, List
 from contextlib import asynccontextmanager
 import logging
-from fastapi import FastAPI, HTTPException, Response
+from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from sentence_transformers import CrossEncoder, SentenceTransformer
@@ -24,7 +25,7 @@ from qdrant_client.http import models
 
 
 import config
-from observability import (
+from ml_backend.observability import (
     setup_logging,
     attach_prometheus,
     Timer,
@@ -33,17 +34,14 @@ from observability import (
     RESULTS_HISTOGRAM,
     RERANK_IMPROVEMENT,
 )
-from cache import get_cached, set_cached, cache_stats, evict_all
+from ml_backend.cache import get_cached, set_cached, cache_stats, evict_all
 from loguru import logger
 
 load_dotenv()
 
 
 class HybridRetriever:
-    """
-    Service class handling the hybrid retrieval pipeline, including vector search,
-    full-corpus BM25, Reciprocal Rank Fusion (RRF), and Cross-Encoder reranking.
-    """
+    """Hybrid retrieval: Qdrant dense search + full-corpus BM25, RRF fusion, cross-encoder rerank."""
 
     def __init__(self):
         self.qdrant: Optional[QdrantClient] = None
@@ -52,8 +50,7 @@ class HybridRetriever:
         self.city_list = set()
         self.embedding_model = config.EMBEDDING_MODEL_NAME
         self.embedder = None
-        # Full-corpus sparse index — real hybrid retrieval, scored against the
-        # whole corpus rather than just whatever dense search happened to return.
+
         self.bm25_full = None
         self.corpus_df: Optional[pd.DataFrame] = None
         self.corpus_city: Optional[pd.Series] = None
@@ -61,12 +58,10 @@ class HybridRetriever:
         self.ready = False
 
     def initialize(self):
-        """
-        Loads required machine learning models (Embedder, Reranker, Spacy)
-        and connects to the Qdrant vector database.
+        """Connects to Qdrant, loads the embedder, reranker, spaCy and BM25 index, then sets ready.
 
         Raises:
-            Exception: If connection to Qdrant fails.
+            Exception: If the Qdrant connection fails.
         """
         logger.info(f"Initializing Hybrid Retriever on {config.DEVICE}...")
 
@@ -120,17 +115,24 @@ class HybridRetriever:
         except Exception as e:
             logger.warning(f"Could not load city list: {e}")
 
-        # 5. Full-corpus sparse index. Both files come from the same embedder.py
-        # run and share row order via the `chunk_id` column, so they can be
-        # joined on it.
+        # 5. Full-corpus sparse index.
         try:
             if config.BM25_PATH.exists() and config.METADATA_PATH.exists():
                 with open(config.BM25_PATH, "rb") as f:
                     self.bm25_full = pickle.load(f)
                 self.corpus_df = pd.read_parquet(
                     config.METADATA_PATH,
-                    columns=["chunk_id", "chunk", "business_id", "restaurant", "city",
-                             "state", "address", "latitude", "longitude"],
+                    columns=[
+                        "chunk_id",
+                        "chunk",
+                        "business_id",
+                        "restaurant",
+                        "city",
+                        "state",
+                        "address",
+                        "latitude",
+                        "longitude",
+                    ],
                 )
                 self.corpus_city = self.corpus_df["city"].fillna("").str.lower()
                 self.corpus_state = self.corpus_df["state"].fillna("")
@@ -148,15 +150,7 @@ class HybridRetriever:
         self.ready = True
 
     def _get_embedding(self, text: str) -> List[float]:
-        """
-        Generates a dense embedding for the given text using the E5 model.
-
-        Args:
-            text (str): The input query string to embed.
-
-        Returns:
-            List[float]: A list of floats representing the embedding vector.
-        """
+        """Returns the normalized E5 query embedding for text."""
         with Timer("retriever", "embedding"):
             vec = self.embedder.encode(
                 f"query: {text}",
@@ -165,38 +159,86 @@ class HybridRetriever:
             )
         return vec.tolist()
 
+    def _detect_raw_location(self, query: str) -> Optional[str]:
+        """Returns the first location in query (pattern, then NER), lowercased, covered or not."""
+        pattern_match = re.search(config.LOCATION_PATTERN, query, re.IGNORECASE)
+        if pattern_match:
+            return pattern_match.group(1).strip().lower()
+
+        if self.nlp:
+            for ent in self.nlp(query).ents:
+                if ent.label_ == "GPE":
+                    return ent.text.strip().lower()
+
+        return None
+
+    def _classify_location(self, text: str) -> Tuple[Optional[str], Optional[str]]:
+        """Returns (city, None), (None, state_code) or (None, None) for lowercased text."""
+        if text in config.DATASET_CITIES:
+            return text, None
+        if text in config.US_STATES:
+            return None, config.US_STATES[text]
+        if text.upper() in config.DATASET_STATES:
+            return None, text.upper()
+        return None, None
+
     def _extract_location(self, query: str) -> Tuple[Optional[str], Optional[str]]:
-        """
-        Extracts City and State entities from the query using Spacy NER
-        and a fallback dictionary lookup.
+        """Returns the dataset (city, state) named in query.
 
-        Args:
-            query (str): The search query.
-
-        Returns:
-            Tuple[Optional[str], Optional[str]]: A tuple containing the extracted (city, state).
+        A state without a city maps to config.STATE_TO_PRIMARY_CITY.
         """
-        doc = self.nlp(query)
         city, state = None, None
 
-        for ent in doc.ents:
-            if ent.label_ == "GPE":
-                text = ent.text.strip().lower()
-                if text in config.US_STATES:
-                    state = config.US_STATES[text]
-                elif text.upper() in config.STATE_ALIASES:
-                    state = text.upper()
-                else:
-                    city = text
+        # 1. "in <Location>" pattern
+        pattern_match = re.search(config.LOCATION_PATTERN, query, re.IGNORECASE)
+        if pattern_match:
+            city, state = self._classify_location(
+                pattern_match.group(1).strip().lower()
+            )
 
-        # Fallback to dictionary match for city
+        # 2. NER on the full query, then on the tail of long queries
+        segments = [query] + ([query[-60:]] if len(query) > 60 else [])
+        for segment in segments:
+            if city or state or not self.nlp:
+                break
+            for ent in self.nlp(segment).ents:
+                if ent.label_ == "GPE":
+                    ent_city, ent_state = self._classify_location(
+                        ent.text.strip().lower()
+                    )
+                    city = ent_city or city
+                    state = ent_state or state
+
+        # 3. Dictionary fallback over individual tokens
         if not city and self.city_list:
-            tokens = query.lower().split()
-            for word in tokens:
-                if word in self.city_list:
+            for word in query.lower().split():
+                if word in config.DATASET_CITIES:
                     city = word
                     break
+
+        # 4. State -> primary city mapping
+        if state and not city:
+            mapped = config.STATE_TO_PRIMARY_CITY.get(state)
+            if mapped:
+                city = mapped
+                logger.info(f"State {state} -> city {city}")
+
         return city, state
+
+    def detect_out_of_coverage(self, query: str) -> Optional[str]:
+        """Returns the detected location if it is outside coverage, else None."""
+        raw = self._detect_raw_location(query)
+        if not raw:
+            return None
+
+        def _mentions(areas: List[str]) -> bool:
+            return any(
+                re.search(r"\b" + re.escape(area) + r"\b", raw) for area in areas
+            )
+
+        if _mentions(config.OUT_OF_COVERAGE) or not _mentions(config.COVERED_AREAS):
+            return raw
+        return None
 
     def search(
         self,
@@ -207,23 +249,17 @@ class HybridRetriever:
         do_rerank: bool,
         max_duplicates: int,
     ):
-        """
-        Executes the Hybrid Search Pipeline:
-        1. Vector Search (Qdrant)
-        2. Full-corpus BM25
-        3. RRF Fusion
-        4. Cross-Encoder Reranking
+        """Runs dense search, BM25, RRF fusion and optional reranking, filtered by detected location.
 
         Args:
-            query (str): The search query provided by the user.
-            top_k (int): Final number of results to return.
-            initial_k (int): Number of initial candidates to retrieve from Qdrant.
-            k_rrf (int): Constant used in the RRF (Reciprocal Rank Fusion) calculation.
-            do_rerank (bool): Flag indicating whether to use the cross-encoder for reranking.
-            max_duplicates (int): Maximum allowable chunks from the same business/restaurant.
+            top_k: Results returned.
+            initial_k: Dense candidates fetched from Qdrant.
+            k_rrf: RRF constant.
+            do_rerank: Rerank fused candidates with the cross-encoder.
+            max_duplicates: Max chunks per restaurant in the results.
 
         Returns:
-            Tuple[List[Dict[str, Any]], float]: A tuple containing the list of formatted result dictionaries and the total retrieval time in milliseconds.
+            (results, retrieval_ms).
         """
 
         t0 = time.perf_counter()
@@ -284,9 +320,7 @@ class HybridRetriever:
             translator = str.maketrans("", "", string.punctuation)
             clean_query = query.lower().translate(translator).split()
             expansions = {
-                syn
-                for tok in clean_query
-                for syn in config.QUERY_SYNONYMS.get(tok, [])
+                syn for tok in clean_query for syn in config.QUERY_SYNONYMS.get(tok, [])
             }
             clean_query = clean_query + [t for t in expansions if t not in clean_query]
 
@@ -319,11 +353,16 @@ class HybridRetriever:
                     local_bm25 = BM25Okapi(tokenized_corpus)
                     local_scores = local_bm25.get_scores(clean_query)
                     for cid, sc in zip(dense_by_id.keys(), local_scores):
-                        sparse_by_id[cid] = {**dense_by_id[cid], "bm25_score": float(sc)}
+                        sparse_by_id[cid] = {
+                            **dense_by_id[cid],
+                            "bm25_score": float(sc),
+                        }
             t3 = time.perf_counter()
 
         # E. Union of dense + sparse candidates, then Reciprocal Rank Fusion.
-        all_ids = list(dict.fromkeys(list(dense_by_id.keys()) + list(sparse_by_id.keys())))
+        all_ids = list(
+            dict.fromkeys(list(dense_by_id.keys()) + list(sparse_by_id.keys()))
+        )
         chunks = []
         for cid in all_ids:
             base = dense_by_id.get(cid) or sparse_by_id.get(cid)
@@ -331,10 +370,20 @@ class HybridRetriever:
         corpus_texts = [c["text"] for c in chunks]
 
         vector_scores = np.array(
-            [dense_by_id[c["id"]]["vec_score"] if c["id"] in dense_by_id else -np.inf for c in chunks]
+            [
+                dense_by_id[c["id"]]["vec_score"] if c["id"] in dense_by_id else -np.inf
+                for c in chunks
+            ]
         )
         bm25_scores = np.array(
-            [sparse_by_id[c["id"]]["bm25_score"] if c["id"] in sparse_by_id else -np.inf for c in chunks]
+            [
+                (
+                    sparse_by_id[c["id"]]["bm25_score"]
+                    if c["id"] in sparse_by_id
+                    else -np.inf
+                )
+                for c in chunks
+            ]
         )
 
         def _ranks(scores: np.ndarray) -> np.ndarray:
@@ -348,9 +397,9 @@ class HybridRetriever:
         vec_rank = _ranks(vector_scores)
         bm25_rank = _ranks(bm25_scores)
 
-        rrf_scores = np.where(np.isfinite(vector_scores), 1 / (k_rrf + vec_rank), 0.0) + np.where(
-            np.isfinite(bm25_scores), 1 / (k_rrf + bm25_rank), 0.0
-        )
+        rrf_scores = np.where(
+            np.isfinite(vector_scores), 1 / (k_rrf + vec_rank), 0.0
+        ) + np.where(np.isfinite(bm25_scores), 1 / (k_rrf + bm25_rank), 0.0)
 
         # Sort by RRF score descending
         candidate_indices = np.argsort(-rrf_scores)
@@ -395,6 +444,7 @@ class HybridRetriever:
                 results.append(
                     {
                         "score": float(score),
+                        "business_id": b_id,
                         "restaurant": c["meta"].get("restaurant", "Unknown"),
                         "text": c["text"],
                         "city": c["meta"].get("city"),
@@ -432,10 +482,7 @@ retriever = HybridRetriever()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """
-    Manages FastAPI application startup and shutdown events,
-    initializing the retriever service upon startup.
-    """
+    """Initializes the retriever on startup."""
     # Startup
     setup_logging("retriever")
     try:
@@ -454,9 +501,7 @@ attach_prometheus(app, "retriever")
 
 # --- Models ---
 class RetrieveRequest(BaseModel):
-    """
-    Pydantic schema for defining user retrieval request payloads.
-    """
+    """Request body for /retrieve."""
 
     query: str
     top_k: int = config.TOP_K
@@ -464,26 +509,22 @@ class RetrieveRequest(BaseModel):
     k_rrf: int = config.RRF_K
     max_duplicates: int = config.MAX_DUPLICATES
     do_rerank: bool = config.DO_RERANK
+    no_cache: bool = False
 
 
 class RetrieveResponse(BaseModel):
-    """
-    Pydantic schema for formatting the retrieval response payload.
-    """
+    """Response body for /retrieve."""
 
     results: List[Dict[str, Any]]
     retrieval_ms: float
+    out_of_coverage: bool = False
+    detected_location: Optional[str] = None
 
 
 # --- Endpoints ---
 @app.get("/health")
 def health_check(response: Response):
-    """
-    Health check endpoint to verify service availability.
-
-    Returns:
-        Dict: A status dictionary reflecting whether the retriever finished initializing.
-    """
+    """Returns service status; 503 until the retriever is initialized."""
     if not retriever.ready or retriever.qdrant is None:
         response.status_code = 503
         return {"status": "not_ready"}
@@ -491,27 +532,26 @@ def health_check(response: Response):
 
 
 @app.post("/retrieve")
-def retrieve_endpoint(req: RetrieveRequest):
-    """
-    Main endpoint for executing a document retrieval query.
-    Checks the local cache before running the full search pipeline.
-
-    Args:
-        req (RetrieveRequest): Request payload containing search parameters.
-
-    Returns:
-        Dict: Contains a list of matching results and execution time in ms.
+def retrieve_endpoint(req: RetrieveRequest, request: Request):
+    """Returns cached or fresh search results; out-of-coverage queries return none.
 
     Raises:
-        HTTPException: If the retriever is not initialized or an internal error occurs.
+        HTTPException: 503 if not initialized; 500 on search errors.
     """
     if not retriever.ready or not retriever.qdrant:
         raise HTTPException(status_code=503, detail="Retriever not initialized")
 
     # Cache check
-    cached = get_cached(
-        req.query, req.top_k, req.do_rerank, req.k_rrf, req.initial_k, req.max_duplicates
-    )
+    cached = None
+    if not req.no_cache:
+        cached = get_cached(
+            req.query,
+            req.top_k,
+            req.do_rerank,
+            req.k_rrf,
+            req.initial_k,
+            req.max_duplicates,
+        )
     if cached is not None:
         CACHE_COUNTER.labels("hit").inc()
         QUERY_COUNTER.labels("retriever", "cache_hit").inc()
@@ -519,6 +559,19 @@ def retrieve_endpoint(req: RetrieveRequest):
 
     # If no cached result, perform full retrieval
     CACHE_COUNTER.labels("miss").inc()
+
+    # Coverage check
+    detected_location = retriever.detect_out_of_coverage(req.query)
+    if detected_location:
+        logger.info(
+            f"Retriever blocked out-of-coverage location: '{detected_location}'"
+        )
+        return {
+            "results": [],
+            "retrieval_ms": 0.0,
+            "out_of_coverage": True,
+            "detected_location": detected_location,
+        }
 
     # Full retrieval pipeline
     try:
@@ -543,38 +596,62 @@ def retrieve_endpoint(req: RetrieveRequest):
     RESULTS_HISTOGRAM.observe(len(results))
     QUERY_COUNTER.labels("retriever", "success").inc()
 
-    if results:
+    if results and not req.no_cache:
         set_cached(
-            req.query, req.top_k, req.do_rerank, results,
-            req.k_rrf, req.initial_k, req.max_duplicates,
+            req.query,
+            req.top_k,
+            req.do_rerank,
+            results,
+            req.k_rrf,
+            req.initial_k,
+            req.max_duplicates,
         )
 
     logger.info(f"Retrieved {(len(results))} for query: '{req.query}'")
+    logger.info(f"Request from IP: {request.headers.get('x-forwarded-for', 'unknown')}")
 
     return {"results": results, "retrieval_ms": retrieval_ms}
 
 
 @app.get("/cache/stats")
 def cache_stats_endpoint():
-    """
-    Retrieves internal cache statistics (hits, misses, sizes).
-
-    Returns:
-        Dict: A dictionary containing cache metrics.
-    """
+    """Returns retrieval cache statistics."""
     return cache_stats()
 
 
 @app.post("/cache/clear")
 def clear_cache_():
-    """
-    Clears all items currently held in the retrieval cache.
-
-    Returns:
-        Dict: A status message confirming cache clearance.
-    """
+    """Evicts every entry from the retrieval cache."""
     evict_all()
     return {"status": "cache cleared"}
+
+
+@app.get("/debug/cities")
+def get_unique_cities():
+    """Returns sorted distinct cities and states in the Qdrant collection (full scroll)."""
+    cities = set()
+    states = set()
+    offset = None
+
+    while True:
+        points, offset = retriever.qdrant.scroll(
+            collection_name=config.COLLECTION_NAME,
+            limit=1000,
+            offset=offset,
+            with_payload=True,
+            with_vectors=False,
+        )
+        for point in points:
+            city = point.payload.get("city")
+            state = point.payload.get("state")
+            if city:
+                cities.add(city.lower().strip())
+            if state:
+                states.add(state.upper().strip())
+        if offset is None:
+            break
+
+    return {"cities": sorted(cities), "states": sorted(states)}
 
 
 if __name__ == "__main__":
