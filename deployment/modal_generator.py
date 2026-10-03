@@ -1,4 +1,15 @@
+"""
+Modal deployment for the DineRAG Generator service.
+
+Deploy (from the repo root):
+    modal deploy deployment/modal_generator.py
+"""
+
+from pathlib import Path
+
 import modal
+
+_ROOT = Path(__file__).resolve().parent.parent
 
 image = (
     modal.Image.debian_slim(python_version="3.11")
@@ -6,15 +17,25 @@ image = (
         "fastapi",
         "uvicorn[standard]",
         "groq",
-        "requests",
+        "anthropic",
+        "httpx",
         "python-dotenv",
         "loguru",
         "prometheus-fastapi-instrumentator",
         "prometheus-client",
+        "wrapt",
     )
-    .add_local_file("generator.py", "/app/generator.py")
-    .add_local_file("observability.py", "/app/observability.py")
-    .add_local_file("config.py", "/app/config.py")
+    .pip_install(
+        "torch",
+        extra_index_url="https://download.pytorch.org/whl/cpu",
+    )
+    .add_local_file(
+        _ROOT / "ml_backend/generator_groq.py", "/app/ml_backend/generator_groq.py"
+    )
+    .add_local_file(
+        _ROOT / "ml_backend/observability.py", "/app/ml_backend/observability.py"
+    )
+    .add_local_file(_ROOT / "config.py", "/app/config.py")
 )
 
 
@@ -24,6 +45,7 @@ app = modal.App("food-rag-generator", image=image)
 @app.function(
     secrets=[modal.Secret.from_name("food-rag-secrets")],
     cpu=1.0,
+    memory=500,
     timeout=120,
     scaledown_window=300,
 )
