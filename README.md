@@ -1,6 +1,6 @@
 # DineRAG: Production-Grade RAG System on the Yelp Business Review Dataset Entirely from Scratch
 
-**DineRAG** is a high-performance Retrieval-Augmented Generation (RAG) system engineered to provide grounded, location-aware restaurant recommendations  **built entirely from scratch without LangChain.** It leverages a **Hybrid Search Architecture** (Dense Vectors + Sparse Keywords) fused with a Cross-Encoder Reranker to retrieve precise context from the Yelp Academic Dataset, which is then synthesized by a 4-bit quantized LLM.
+**DineRAG** is a high-performance Retrieval-Augmented Generation (RAG) system engineered to provide grounded, location-aware restaurant recommendations  **built entirely from scratch without any RAG framework.** It leverages a **Hybrid Search Architecture** (Dense Vectors + Sparse Keywords) fused with a Cross-Encoder Reranker to retrieve precise context from the Yelp Academic Dataset, which is then synthesized by a dual 4-bit quantized LLM offline route and Claude Haiku online route.
 
 The system is architected as a set of decoupled, asynchronous microservices to ensure scalability and fault tolerance.
 
@@ -24,10 +24,6 @@ The system is architected as a set of decoupled, asynchronous microservices to e
 ![Next.js](https://img.shields.io/badge/Next.js-Frontend-000000?logo=nextdotjs&logoColor=white)
 ![Vercel](https://img.shields.io/badge/Vercel-Deployment-000000?logo=vercel&logoColor=white)
 
-
-
-
-
 ![Demo GIF](data/demo.gif)
 
 > ⚡ **Live Demo:** [yelp-restaurant-rag.vercel.app](https://yelp-restaurant-rag.vercel.app)
@@ -37,7 +33,7 @@ The system is architected as a set of decoupled, asynchronous microservices to e
 
 ## Why From Scratch?
 
-To demonstrate a real understanding of everything that happens under the hood of RAG Frameworks. DineRAG is built with full control and zero abstractions. There is no managed loader, no pre-built retriever, no abstracted LLM call.
+To demonstrate a real understanding of everything that happens under the hood of RAG Frameworks. DineRAG is built with full control and zero abstractions. No RAG frameworks. There is no managed loader, no pre-built retriever, no abstracted LLM call.
 
 
 ## Index
@@ -76,7 +72,7 @@ To demonstrate a real understanding of everything that happens under the hood of
 
 * [Inference](#inference)
 
-  * [Production - Groq API](#production---groq-api)
+  * [Production - Claude Haiku 4.5 with Groq Fallback](#production---claude-haiku-45-with-groq-fallback)
 
   * [Local / Offline - Qwen2.5-3B NF4](#local--offline---qwen25-3b-nf4)
 
@@ -89,6 +85,8 @@ To demonstrate a real understanding of everything that happens under the hood of
   * [Serverless Backend (Modal)](#serverless-backend-modal)
 
   * [Frontend](#frontend)
+
+  * [MCP Server (Claude / any MCP client)](#mcp-server-claude--any-mcp-client)
 
 * [Performance](#performance)
 
@@ -128,98 +126,98 @@ To demonstrate a real understanding of everything that happens under the hood of
 ## Architecture Overview
 
 ```
-Raw Yelp JSON (~10GB)
-    → Preprocessor (scoring, filtering, sentiment sampling)
-    → Chunker (token-bounded, typed chunks)
-    → Embedder (E5-large-v2, BM25 index)
-    → Qdrant Cloud (vector DB)
-         ↓
-Retriever Microservice (FastAPI)
-    → Geo filter (spaCy NER)
-    → Qdrant vector search (HNSW)
-    → Full-corpus BM25 (independent sparse retrieval, query synonym expansion)
-    → RRF fusion
-    → CrossEncoder reranking
-         ↓
-Generator Microservice (FastAPI)
-    → Intent Classification (llama-3.1-8b-instant via Groq)
-         ↓ food_search / location_only → proceed
-         ↓ greeting / identity / off_topic → short-circuit, no retrieval
-    → Coverage Guard (COVERED_AREAS / OUT_OF_COVERAGE blocklists)
-         ↓ out-of-coverage → short-circuit, no retrieval
-    → Groq API (gpt-oss-20b, production)
-    → Local Qwen2.5-3B NF4 (offline mode)
-         ↓
-Next.js Frontend (Vercel)
+                  ┌──────────────────────────────┐
+                  │    Raw Yelp JSON (~10GB)     │
+                  └──────────────┬───────────────┘
+                                 ▼
+          ┌──────────────────────────────────────────────┐
+          │  OFFLINE DATA PIPELINE                       │
+          │  Preprocessor   scoring, filtering, sampling │
+          │  Chunker        token-bounded, typed chunks  │
+          │  Embedder       E5-large-v2 + BM25 index     │
+          └──────────────────────┬───────────────────────┘
+                                 ▼
+                  ┌──────────────────────────────┐
+                  │   Qdrant Cloud (vector DB)   │
+                  └──────────────┬───────────────┘
+                                 ▼
+          ┌──────────────────────────────────────────────┐
+          │  RETRIEVER SERVICE (FastAPI)                 │
+          │  Geo filter        spaCy NER                 │
+          │  Dense search      Qdrant HNSW               │
+          │  Sparse search     full-corpus BM25          │
+          │  Fusion            RRF                       │
+          │  Rerank            CrossEncoder              │
+          └──────────────────────┬───────────────────────┘
+                                 ▼
+          ┌──────────────────────────────────────────────┐
+          │  GENERATOR SERVICE (FastAPI)                 │
+          │  Intent check    greeting/off_topic → canned │
+          │  Coverage guard  out of coverage → canned    │
+          │  LLM   Claude Haiku 4.5 → Groq gpt-oss-20b   │
+          │        Qwen2.5-3B NF4 (local / offline)      │
+          └──────────────────────┬───────────────────────┘
+                                 ▼
+                  ┌──────────────────────────────┐
+                  │  Next.js Frontend (Vercel)   │
+                  └──────────────────────────────┘
 ```
 
 ## Data Pipeline — From Raw Yelp JSON to Production Grade Vector DB
 
-The entire data pipeline is hand-built from the raw 
-[Yelp Academic Dataset](https://www.yelp.com/dataset) ~10GB across multiple 
-JSON files with no managed loaders, pre-processed datasets, or data APIs.
+The pipeline starts from the raw [Yelp Academic Dataset](https://www.yelp.com/dataset), about 10GB spread over several JSON files. There are no data loaders, preprocessed versions or data APIs involved.
 
 ### Challenges solved:
 
-**1. Multi-file joins at scale**: Streamed joins between `business.json` and `review.json` using `business_id`. without loading full datasets into RAM.
+**1. Multi-file joins at scale**: `business.json` and `review.json` are joined on `business_id` as they're streamed, so neither file is ever fully in memory.
 
-**2. Category filtering**: Parsed Yelp’s free-text category lists to isolate restaurants from 1000+ business types.
+**2. Category filtering**: Yelp categories are free text, so restaurants are picked out of 1000+ business types by parsing those lists.
 
-**3. Custom Restaurant Score**: Built a weighted ranking system combining rating, review count, and recency for more reliable quality scoring.
+**3. Custom Restaurant Score**: Restaurants are ranked by a weighted score built from rating, review count and recency. Raw stars alone aren't reliable.
 
-**4. Balanced sentiment sampling**: Sampled reviews across positive, neutral, and negative buckets to capture tradeoffs, not just high ratings.
+**4. Balanced sentiment sampling**: Reviews are sampled from positive, neutral and negative buckets, so the model hears about the downsides too.
 
-**5. Token-bounded chunking**: Used E5's own tokenizer for splitting so chunk budgets match what the embedding model  sees.
+**5. Token-bounded chunking**: Chunks are split with E5's own tokenizer, so the token budget matches what the embedding model sees.
 
-**6. Typed chunk structure**: Created structured chunks (profile, positive, negative) instead of raw text to improve retrieval specificity.
+**6. Typed chunk structure**: Each restaurant becomes several kinds of chunks (profile, positive, negative and so on) instead of one block of raw text, which makes retrieval more precise.
 
-**7. Embedding at scale**: Generated E5-large-v2 embeddings in batches and stored them as .pt tensors for fast reload.
+**7. Embedding at scale**: E5-large-v2 embeddings are generated in batches and saved as `.pt` tensors, so they reload quickly.
 
-**8. Stable deduplication**: Used UUID5-based deterministic IDs to ensure idempotent reprocessing without duplicates.
+**8. Stable deduplication**: Point IDs are UUID5 hashes, so re-running the pipeline doesn't create duplicates.
 
-**9. Generator-based ingestion**: Streamed Qdrant uploads in batches of 256 using generators to keep memory usage constant.
+**9. Generator-based ingestion**: Uploads to Qdrant go through a generator in batches of 256, so memory use stays flat no matter how big the dataset is.
 
 ---
 
 ## Under the Hood
 
 ### Streaming Filter Cascade (`preprocessor.py`)
-Reviews are filtered at parse time in cheapest-to-expensive order to avoid loading 20GB+ into RAM:
-1. **Business ID** — O(1) set lookup. Filters 95% of records instantly.
-2. **Date filter** — lexicographic ISO string compare.
-3. **Word count** — `text.split()` only runs on the survivors of (1) and (2).
+Reviews are filtered while they're parsed, cheapest check first, so the 20GB+ of reviews never has to sit in RAM:
+1. **Business ID**: a set lookup that drops about 95% of records right away.
+2. **Date filter**: a plain ISO date string comparison.
+3. **Word count**: `text.split()` only runs on reviews that passed the first two checks.
 
 ### Composite Restaurant Scoring (`preprocessor.py`)
-Raw star ratings are statistically broken for ranking; 3 reviews at 5 outranks
-2000 reviews at 4.7 naively. I Built a two-component weighted score:
-- `restaurant_score = stars × log1p(review_count)` — long-term reputation signal
-- `reviews_score = mean_stars × log1p(sum_stars)` — recent review quality
+Ranking by raw stars doesn't work. A place with three 5-star reviews would beat one with 2,000 reviews averaging 4.7. So each restaurant gets two scores:
+- `restaurant_score = stars × log1p(review_count)` for long-term reputation
+- `reviews_score = mean_stars × log1p(sum_stars)` for the quality of recent reviews
 
-Both are Min-Max normalized before combining with tunable coefficients.
-City caps are adaptive, dense cities (600+ restaurants) get higher limits than sparse ones.
+Both are min-max normalized and then combined with tunable weights. Each city has a cap on how many restaurants it keeps, and the cap is higher for dense cities (600+ restaurants) than for sparse ones.
 
 ### Balanced Sentiment Sampling (`pipeline.py`)
-Naive top-N sampling produces all 5-star reviews. The LLM then has no context
-on wait times, portion sizes, or service issues. Reviews are sampled proportionally
-across positive/neutral/negative buckets with ceiling rounding to preserve rare
-sentiment classes.
+If you just take the top N reviews, you get nothing but 5-star reviews, and the LLM never hears about wait times, portion sizes or bad service. Reviews are sampled proportionally from positive, neutral and negative buckets. Counts are rounded up so rare sentiment classes don't disappear.
 
 ### Token-Bounded Chunking (`chunker.py`)
-Chunking tokenizes with E5's own tokenizer, so the token budget matches what
-the embedder sees. Individual reviews are capped and truncated at the token
-level (not by character count) before being packed into a batch, so a single
-long review can't blow the chunk budget on its own.
+Chunks are measured with E5's own tokenizer, so the token budget matches what the embedder sees. Each review is truncated by tokens, not characters, before it's packed into a chunk. That way one long review can't use up the whole chunk.
 
 ### Typed Chunk Structure (`chunker.py`)
-The chunks are not raw review blocks. Each restaurant produces structured chunk types:
-- **Business Profile** — name, location, category, hours
-- **Attribute chunks** — parsed from Yelp's nested stringified dicts (e.g. WiFi, parking, alcohol)
-- **Vibe chunks** — atmosphere descriptors extracted from nested attribute maps
-- **Positive / Neutral / Negative review batches** — sentiment-separated for retrieval precision
+Each restaurant becomes several typed chunks instead of one big block of reviews:
+- **Business Profile**: name, location, category, hours
+- **Attribute chunks**: parsed from Yelp's nested stringified dicts (WiFi, parking, alcohol, etc.)
+- **Vibe chunks**: atmosphere descriptors pulled from the nested attribute maps
+- **Positive / Neutral / Negative review batches**: reviews grouped by sentiment
 
-This allows the retriever to surface different facets of the same restaurant
-depending on query intent, a "romantic atmosphere" query hits vibe chunks,
-a "avoid if in a rush" query hits negative review chunks.
+This lets a query find the part of a restaurant it's actually asking about. "Romantic atmosphere" matches vibe chunks, and "avoid if in a rush" matches negative review chunks.
 
 ---
 
@@ -227,28 +225,28 @@ a "avoid if in a rush" query hits negative review chunks.
 
 ### Hybrid Search
 
-**Dense retrieval** — E5-large-v2 embeddings queried against Qdrant HNSW index. Captures semantic similarity ("cheap eats" -> "affordable prices").
+**Dense retrieval**: E5-large-v2 embeddings searched in Qdrant's HNSW index. This catches matches with different wording, like "cheap eats" and "affordable prices".
 
-**Sparse retrieval** — BM25 over the full chunk corpus. A small synonym table expands the sparse query (e.g. "bbq" <-> "barbecue", "brunch" <-> "breakfast").
+**Sparse retrieval**: BM25 over every chunk. A small synonym table expands the query, for example "bbq" ↔ "barbecue" and "brunch" ↔ "breakfast".
 
-**RRF fusion** — Reciprocal Rank Fusion combines both rankings without score normalization:
+**RRF fusion**: Reciprocal Rank Fusion merges the two ranked lists. It only uses ranks, so the two kinds of scores don't need normalizing:
 ```
 rrf_score = 1/(k + vec_rank) + 1/(k + bm25_rank)    k=60
 ```
 
-**Cross-encoder reranking** — `ms-marco-MiniLM-L-6-v2` processes `[CLS] Query [SEP] Document` jointly, enabling deep interaction modeling between query and document tokens.
+**Cross-encoder reranking**: `ms-marco-MiniLM-L-6-v2` reads the query and each chunk together as `[CLS] Query [SEP] Document`. That makes it more accurate than comparing two separate embeddings.
 
 ### Location Extraction
-spaCy NER extracts city/state from queries. Fallback dictionary matching handles abbreviations ("Philly" -> Philadelphia, "NOLA" -> New Orleans) and state→city routing ("Pennsylvania" -> Philadelphia metro).
+spaCy NER finds the city or state in the query. A fallback dictionary handles nicknames ("Philly" → Philadelphia, "NOLA" → New Orleans) and maps states to cities ("Pennsylvania" → the Philadelphia metro).
 
 ---
 
 ## Query Routing
 
-Before any retrieval occurs, every query passes through two filtering layers:
+Not every message needs a search. Each query goes through two checks before any retrieval happens.
 
 ### Intent Classification
-`llama-3.1-8b-instant` via Groq classifies the query (~200ms) into one of:
+Claude Haiku 4.5 (`claude-haiku-4-5`) sorts the query into one of these intents. If the Claude call fails, Groq's `openai/gpt-oss-20b` does it instead:
 
 | Intent | Action |
 |:---|:---|
@@ -260,31 +258,33 @@ Before any retrieval occurs, every query passes through two filtering layers:
 
 
 ### Coverage Guard (Two Layers)
-Out-of-coverage cities are blocked before retrieval at two independent points:
+Questions about cities outside the dataset are stopped in two places:
 
-- **Generator-level** — `is_out_of_coverage()` checks the query against `COVERED_AREAS` / `OUT_OF_COVERAGE` lists before calling the retriever
-- **Retriever-level** — `_detect_raw_location()` catches anything that slips through, returns `out_of_coverage: true` with empty results so irrelevant source cards never appear in the UI
+- **Generator-level**: `is_out_of_coverage()` checks the query against the `COVERED_AREAS` / `OUT_OF_COVERAGE` lists before calling the retriever.
+- **Retriever-level**: `_detect_raw_location()` catches anything that gets past the first check. It returns `out_of_coverage: true` with no results, so the UI never shows cards for unrelated restaurants.
 
-Both layers use raw location detection (NER + regex) that is **not** filtered against the dataset so an unknown city like "Athens" is detected and blocked rather than silently returning unfiltered results from other cities.
+Both checks detect any location (NER + regex), not just the cities in the dataset. So a query about "Athens" gets blocked, instead of quietly returning results from some other city.
 
 ---
 
 ## Inference
 
-Two generator paths are implemented production uses Groq, local runs a fully quantized model offline.
+There are two ways to generate answers: the production path (Claude, falling back to Groq) and a local path that runs a quantized model offline.
 
-### Production - Groq API
-`gpt-oss-20b` via Groq. Zero GPU cost, zero VRAM. Response is currently buffered by Modal's ASGI proxy — full response arrives after ~4s rather than true token streaming.
+### Production - Claude Haiku 4.5 with Groq Fallback
+`claude-haiku-4-5` is tried first, and if it fails the request goes to `openai/gpt-oss-20b` on Groq. You can change the order with `GENERATION_PROVIDER_ORDER` (default `claude,groq`). The response stream includes a `provider` frame that says which model answered. No GPU is needed.
+
+Groq path (Modal's ASGI proxy buffers the response):
 
 | Metric | Value |
 |:---|:---|
-| TTFT | ~4s (Modal buffered) |
-| Tokens/sec | ~400k |
+| TTFT (Groq) | ~4s (Modal buffered) |
+| Tokens/sec (Groq) | ~400k |
 | GPU cost | 0 |
 
 ### Local / Offline - Qwen2.5-3B NF4
 
-Qwen2.5-3B-Instruct in 4-bit NF4 quantization via `bitsandbytes`. Measured on RTX 3060 6GB:
+Qwen2.5-3B-Instruct, quantized to 4-bit NF4 with `bitsandbytes`. These numbers are from an RTX 3060 (6GB):
 
 | Metric | Value |
 |:---|:---|
@@ -306,18 +306,18 @@ BitsAndBytesConfig(
 )
 ```
 
-- `attn_implementation="sdpa"` — PyTorch scaled dot-product attention
-- `torch.backends.cuda.matmul.allow_tf32 = True` — TF32 on Ampere
-- `TextIteratorStreamer` + background thread — `model.generate()` runs in a thread, main thread yields tokens without blocking the event loop
-- `gc.collect()` + `torch.cuda.empty_cache()` + `torch.cuda.ipc_collect()` after each generation prevents VRAM fragmentation across requests
+- `attn_implementation="sdpa"`: PyTorch's scaled dot-product attention
+- `torch.backends.cuda.matmul.allow_tf32 = True`: TF32 math on Ampere GPUs
+- `TextIteratorStreamer` with a background thread: `model.generate()` runs in its own thread, and tokens are streamed from the main thread without blocking the event loop
+- `gc.collect()`, `torch.cuda.empty_cache()` and `torch.cuda.ipc_collect()` run after every generation so VRAM doesn't fragment over many requests
 
-**Why not 7B?** Qwen2.5-7B NF4 theoretically fits (~3.5GB weights) but spills onto CPU at inference time on 6GB. Measured result: TTFT 58s, 0.6 tokens/sec, ~22 minutes for a full response. So 3B NF4 is the best choice for 6GB VRAM.
+**Why not 7B?** On paper, Qwen2.5-7B NF4 fits (about 3.5GB of weights), but on a 6GB card it spills onto the CPU during inference. I measured a 58s TTFT and 0.6 tokens/sec, so a full answer took about 22 minutes. 3B NF4 is the best fit for 6GB of VRAM.
 
 ### Comparison
 
 | Path | Model | VRAM | TTFT (warm) | Tokens/sec | Streaming |
 |:---|:---|:---|:---|:---|:---|
-| Production | gpt-oss-20b via Groq | 0 | ~4s | N/A (buffered) | Buffered |
+| Production (fallback) | gpt-oss-20b via Groq | 0 | ~4s | N/A (buffered) | Buffered by Modal proxy |
 | Local | Qwen2.5-3B NF4 | 2.2GB | ~3.7s | 11.8 | Real token stream |
 | Local (attempted) | Qwen2.5-7B NF4 | 6GB+ (CPU offload) | ~58s | 0.6 | — |
 
@@ -325,40 +325,47 @@ BitsAndBytesConfig(
 
 ## Retrieval Quality Evaluation
 
-47 queries across all 12 dataset cities. Human-labeled relevance judgments. Fuzzy name matching with accent normalization, city/branch suffix stripping, and token-subset matching. Bootstrap 95% CI.
+The test set has 70 queries covering all 12 cities in the dataset, plus some queries that don't name a city. I report MRR@5, Hit@3, Hit@5 and P@5 (always divided by k), each with a bootstrap 95% confidence interval.
 
-| Strategy | MRR@5 | 95% CI | Hit@3 | Hit@5 | P@5 | Avg Latency |
-|:---|:---|:---|:---|:---|:---|:---|
-| Hybrid + Rerank | 0.760 | [0.678, 0.841] | 0.979 | 1.000 | 0.413 | 13ms |
-| Hybrid (no rerank) | 0.639 | [0.524, 0.753] | 0.745 | 0.830 | 0.349 | 14ms |
+**Labels.** Relevance is judged per restaurant (`business_id`). I pooled the top 10 results from every strategy and RRF setting, added the older name-based labels, and marked each of the 1,023 candidates y/n (`eval_labels.py` → `eval_data/label_pool.csv` → `eval_data/qrels.json`). Results nobody judged count as not relevant.
+
+**Measurement.** Caching is turned off (`no_cache=true`). Latency is recorded on both the client and the server, as mean, p50 and p95.
+
+Results from 2026-09-25, with `k_rrf=60`, `initial_k=30`, `max_duplicates=1` and client-side latency:
+
+| Strategy | MRR@5 | 95% CI | Hit@3 | Hit@5 | P@5 | Mean latency | p95 latency |
+|:---|:---|:---|:---|:---|:---|:---|:---|
+| Hybrid + Rerank | 0.957 | [0.914, 0.993] | 0.986 | 0.986 | 0.883 | 554ms | 706ms |
+| Hybrid (no rerank) | 0.948 | [0.900, 0.986] | 0.986 | 0.986 | 0.823 | 477ms | 591ms |
 
 **Key Findings**
 
-- **Ground-truth refinement:** Updated evaluation labels to include valid retrieved restaurants that were previously excluded, added missing location aliases (e.g., `philly`, `nola`, `indy`), and introduced BM25-side synonym expansion for sparse retrieval gaps, reducing false retrieval failures to zero.
-- **Reranking impact:** Hybrid retrieval with CrossEncoder reranking consistently outperformed the non-reranked baseline, improving MRR@5 by **+0.121**, Hit@5 by **+0.170**, and P@5 by **+0.064** with comparable latency.
-- **RRF sensitivity:** Sweeping `RRF_K` across 10–150 showed negligible performance differences (<0.01 across metrics), indicating that the CrossEncoder reranker contributes most of the final ranking improvement once relevant candidates are retrieved.
-- **Query category performance:** Cuisine-based queries achieved the strongest results (**MRR@5 = 0.922**).
-- **Geographic filtering:** Location-aware retrieval achieved **100% metro-area accuracy** across the evaluation benchmark.
-- **Caching fixes:** Improved query cache reliability by including retrieval parameters (`k_rrf`, `initial_k`, `max_duplicates`) in cache keys and clearing stale cached results after ranking logic changes.
+- **Reranking:** raises P@5 from 0.823 to 0.883 and adds about 75ms. The MRR@5 gain (+0.010, 95% CI [−0.043, +0.062], W/L/T 4/3/63) is not significant.
+- **RRF sensitivity:** the choice of `k_rrf` barely matters. These runs skip reranking, because the reranked output doesn't depend on `k_rrf`:
 
-Eval script: `ml_backend/evaluation.py`.
-
-### Generation Quality (DeepEval)
-
-`eval_generation.py` scores the generator's actual output, judged by an LLM, on two metrics:
-
-- **Faithfulness** — answer claims are checked against the retrieved context.
-- **Answer Relevancy** — answer is checked against the query.
-
-Judge model: `GroqJudge`, a DeepEval model wrapping this project's own Groq client — no OpenAI key required.
+  | `k_rrf` | 10 | 30 | 60 | 100 | 150 |
+  |:---|:---|:---|:---|:---|:---|
+  | MRR@5 | 0.944 | 0.946 | 0.948 | 0.948 | 0.948 |
+  | P@5 | 0.809 | 0.823 | 0.823 | 0.823 | 0.823 |
+  | Hit@5 | 1.000 | 0.986 | 0.986 | 0.986 | 0.986 |
+- **Geographic filtering:** 100% of results come from the requested city, because the city filter is strict.
+- **Caching:** `k_rrf`, `initial_k` and `max_duplicates` are included in the cache key, so changing them never returns stale cached results.
 
 ```bash
-python eval_generation.py --url http://127.0.0.1:9000 --limit 15
+# 1. Build the candidate pool
+python eval_labels.py pool --url http://127.0.0.1:8000
+python eval_labels.py import
+
+# 2. Evaluate (uncached), and sweep RRF k
+python eval.py --url http://127.0.0.1:8000 --mlflow --out results.json
+python eval.py --url http://127.0.0.1:8000 --mlflow --sweep-rrf 10,30,60,100,150
 ```
+
+The eval scripts are `eval.py` and `eval_labels.py`.
 
 ### Experiment Tracking (MLflow)
 
-`eval.py` and `eval_generation.py` both support `--mlflow`, logging runs to a local MLflow store instead of stdout only. Retrieval and generation quality become comparable across config changes — RRF_K sweeps, reranker on/off, judge model swaps.
+Add `--mlflow` to `eval.py` or `eval_generation.py` to log the run to MLflow.
 
 ```bash
 python eval.py --url http://127.0.0.1:8000 --mlflow
@@ -366,9 +373,6 @@ python eval_generation.py --url http://127.0.0.1:9000 --mlflow
 
 mlflow ui --backend-store-uri sqlite:///mlruns/mlflow.db
 ```
-
-Runs are under `Model training` in the MLflow UI, not the `GenAI` traces view.
-
 ---
 
 ## Deployment
@@ -380,12 +384,48 @@ Runs are under `Model training` in the MLflow UI, not the `GenAI` traces view.
 | Retriever | 2 CPU, 2GB RAM |
 | Generator | 1 CPU, 0.5GB RAM |
 
-- E5-large-v2 and CrossEncoder pre-cached in a Modal Volume cold starts load from volume (~5-10s), not the internet
-- `keep_warm=1` on retriever keeps one container warm
-- Query result cache (diskcache / SQLite, 6-hour TTL) repeated queries skip retrieval entirely
+- The E5-large-v2 and CrossEncoder weights are stored in a Modal Volume, so a cold start loads them from disk (about 5–10s) instead of downloading them.
+- `keep_warm=1` keeps one retriever container running at all times.
+- Query results are cached in diskcache (SQLite) for 6 hours, so a repeated query skips retrieval entirely.
 
 ### Frontend
-Next.js on Vercel. Token streaming, interactive Leaflet map, restaurant cards with Maps/Yelp links, retrieval latency display.
+A Next.js app on Vercel. It streams answers token by token, shows results on an interactive Leaflet map, has restaurant cards with Google Maps and Yelp links, and displays how long retrieval took.
+
+### MCP Server (Claude / any MCP client)
+`mcp_server.py` lets Claude or any other MCP client use DineRAG as a set of tools over stdio. It talks to the deployed services over HTTP, so the only install is `pip install mcp==2.2.0 httpx`.
+
+| Tool | Calls | Returns |
+|:---|:---|:---|
+| `search_restaurant_reviews(query, top_k=5)` | `POST /retrieve` | Top restaurants (1-20) with city, address, score and a review excerpt, or an out-of-coverage notice |
+| `ask_restaurant_question(query, city?, state?)` | `POST /generate` (streamed) | The generated answer plus the restaurants it cited |
+| `list_covered_areas()` | `GET /debug/cities` | Covered cities and states (cached for 1 hour) |
+
+Claude Code:
+```bash
+claude mcp add dinerag -- python /abs/path/to/mcp_server.py
+```
+
+Claude Desktop (`claude_desktop_config.json`):
+```json
+{
+  "mcpServers": {
+    "dinerag": {
+      "command": "python",
+      "args": ["/abs/path/to/mcp_server.py"]
+    }
+  }
+}
+```
+
+By default it uses the live Modal deployment. To point it at services running locally, set:
+
+| Variable | Default | Local |
+|:---|:---|:---|
+| `DINERAG_RETRIEVER_URL` | `https://megumind6172--food-rag-retriever-serve.modal.run` | `http://localhost:8000` |
+| `DINERAG_GENERATOR_URL` | `https://megumind6172--food-rag-generator-serve.modal.run` | `http://localhost:9000` |
+| `DINERAG_TIMEOUT` | `90` (seconds; allows for Modal cold starts) | |
+
+To try the tools in the MCP Inspector: `npx @modelcontextprotocol/inspector python mcp_server.py`
 
 ---
 
@@ -397,7 +437,7 @@ Next.js on Vercel. Token streaming, interactive Leaflet map, restaurant cards wi
 |:---|:---|
 | E5 embedding (CPU) | ~200–500ms |
 | Qdrant vector search | ~133–700ms |
-| BM25 + RRF | ~0ms (pre-full-corpus-BM25 measurement, needs re-benchmarking) |
+| BM25 + RRF | ~0ms (measured before BM25 covered the full corpus; needs re-measuring) |
 | CrossEncoder rerank | ~200–400ms |
 | **Total retrieval** | **~700ms–1.2s** |
 
@@ -405,10 +445,10 @@ Next.js on Vercel. Token streaming, interactive Leaflet map, restaurant cards wi
 
 | Path | Generator | Total |
 |:---|:---|:---|
-| Production (Groq) | ~4s buffered | ~5–6s |
-| Local (2.5-3B NF4) | ~3.7s TTFT + ~60s generation | ~64s |
+| Production (Groq, measured) | ~4s buffered | ~5–6s |
+| Local (Qwen2.5-3B NF4) | ~3.7s TTFT + ~60s generation | ~64s |
 
-Variance is inherent to free-tier serverless infrastructure. A paid Qdrant cluster + dedicated CPU would bring down retrieval time consistently.
+These numbers jump around because everything runs on free-tier serverless. A paid Qdrant cluster and dedicated CPUs would make retrieval faster and more consistent.
 
 ---
 
@@ -420,12 +460,14 @@ DineRAG/
 ├── ml_backend/
 │   ├── config.py             # Centralized configuration
 │   ├── retriever.py          # Hybrid search, RRF, geo-filter (FastAPI)
-│   ├── generator_groq.py     # Groq generator, production (FastAPI)
+│   ├── generator_groq.py     # Production generator, Claude → Groq fallback (FastAPI)
 │   ├── generator_local.py    # Local quantized  generator (FastAPI)
 │   ├── cache.py              # diskcache SQLite query result cache
 │   ├── observability.py      # Prometheus metrics + loguru logging
-│   ├── evaluation.py         # MRR, Hit@K, P@K, bootstrap CI (+ optional MLflow logging)
-│   └── eval_generation.py    # Faithfulness / answer relevancy via DeepEval (Groq judge)
+│   ├── eval.py               # MRR, Hit@K, P@K, paired bootstrap CIs, RRF sweep (+ optional MLflow logging)
+│   ├── eval_labels.py        # Builds the pooled candidate CSV for y/n judging → qrels.json
+│   ├── eval_generation.py    # Faithfulness / answer relevancy via DeepEval (Groq judge)
+│   └── mcp_server.py         # MCP server (stdio) exposing the deployed services as tools
 ├── data_pipeline/
 │   ├── preprocessor.py       # Raw Yelp NDJSON filtering + scoring
 │   ├── chunker.py            # Token-bounded semantic chunking
@@ -435,9 +477,12 @@ DineRAG/
 │   ├── modal_retriever.py    # Modal serverless — retriever
 │   └── modal_generator.py    # Modal serverless — generator
 ├── dags/
-│   └── dinerag_pipeline_dag.py  # Airflow DAG 
+│   └── dinerag_pipeline_dag.py  # Airflow DAG wrapping the data_pipeline stages
+├── orchestration/
+│   └── requirements-airflow.txt  # Airflow's own pin — install in a separate venv
 ├── .github/workflows/ci.yml  # pytest on push/PR
-├── tests/                    # pytest suite — cache, chunking, eval metrics, generator helpers
+├── eval_data/                # label_pool.csv (judged candidates) + qrels.json (relevance labels)
+├── tests/                    # pytest suite — cache, chunking, eval metrics/labels, generator helpers, MCP server
 ├── conftest.py
 ├── requirements.txt
 └── ui/                        # Next.js frontend
@@ -447,11 +492,11 @@ DineRAG/
 
 ## Performance Optimizations Implemented
 
-1. **Parquet & PyTorch Formats:** Replaced standard CSV/JSON/Pickle intermediate files with **Parquet** (for metadata) and **.pt Tensors** (for vectors). 
-2. **Pandas Vectorization:** `chunker.py` used `df.explode()` and `df.melt()` instead of expensive `for` loops. This moves the iteration logic to C-level Pandas optimizations, speeding up processing.
-3. **Generator-Based Ingestion:** The `ingestor.py` does not load the full dataset into RAM. It lazily reads from the disk and yields batches to the Qdrant client, allowing the ingestion of datasets larger than system RAM.
-4. **Query cache** — diskcache (SQLite-backed) with 6-hour TTL; repeated queries skip retrieval entirely
-5. **Qdrant co-location** — database and compute in same cloud region eliminates cross-cloud latency (~200ms saved)
+1. **Parquet & PyTorch Formats:** Intermediate files are **Parquet** (metadata) and **.pt tensors** (vectors) instead of CSV, JSON or pickle.
+2. **Pandas Vectorization:** `chunker.py` uses `df.explode()` and `df.melt()` instead of Python `for` loops, so the looping happens inside pandas' C code and runs much faster.
+3. **Generator-Based Ingestion:** `ingester.py` never loads the whole dataset into RAM. It reads from disk lazily and hands batches to the Qdrant client, so it can ingest datasets bigger than system memory.
+4. **Query cache:** diskcache (backed by SQLite) with a 6-hour TTL. Repeated queries skip retrieval entirely.
+5. **Qdrant co-location:** the database and the compute run in the same cloud region, which saves about 200ms of cross-cloud latency.
 
 ## Setup
 
@@ -467,10 +512,12 @@ DineRAG/
 git clone https://github.com/your-username/dinerag.git
 cd dinerag
 python -m venv venv
-source venv/bin/activate
+source venv/bin/activate  # Windows: venv\Scripts\activate
 
 pip install -r requirements.txt
-
+# requirements.txt pins CPU torch; for GPU (local inference), install the matching
+# CUDA build first, e.g.:
+#   pip install torch==2.6.0+cu124 torchvision==0.21.0+cu124 torchaudio==2.6.0+cu124 --index-url https://download.pytorch.org/whl/cu124
 python -m spacy download en_core_web_sm
 ```
 
@@ -481,9 +528,13 @@ python -m spacy download en_core_web_sm
 QDRANT_URL=http://localhost:6333
 QDRANT_API_KEY=
 RETRIEVER_URL=http://127.0.0.1:8000/retrieve
+ANTHROPIC_API_KEY=sk-ant-...
 GROQ_API_KEY=gsk_...
-GROQ_MODEL_ID=gpt-oss-20b
+# Optional (default: claude,groq)
+GENERATION_PROVIDER_ORDER=claude,groq
 ```
+
+You need at least one of `ANTHROPIC_API_KEY` or `GROQ_API_KEY`.
 
 `.env.local` (frontend):
 ```ini
@@ -500,7 +551,7 @@ python data_pipeline/embedder.py
 python data_pipeline/ingester.py
 ```
 
-**Run as an orchestrated Airflow DAG** (`dags/dinerag_pipeline_dag.py`), 4 tasks in sequence instead of 4 manual invocations. 
+**Or run it with Airflow** (`dags/dinerag_pipeline_dag.py`). Airflow 3.3.0 needs its own venv, and on Windows it has to run under WSL2.
 
 ```bash
 pip install -r orchestration/requirements-airflow.txt   # separate venv, WSL2 on Windows
@@ -513,8 +564,10 @@ airflow standalone
 ### Run Services
 
 ```bash
+# Terminal 1
 uvicorn ml_backend.retriever:app --port 8000
 
+# Terminal 2 — Claude/Groq (production) or generator_local (offline/local GPU)
 uvicorn ml_backend.generator_groq:app --port 9000
 
 # Terminal 3
@@ -524,7 +577,7 @@ cd ui && npm run dev
 ### Run Evaluation
 
 ```bash
-python ml_backend/evaluation.py --url http://127.0.0.1:8000 --top_k 8 --verbose
+python eval.py --url http://127.0.0.1:8000 --verbose
 ```
 
 ### Run Tests
@@ -533,7 +586,7 @@ python ml_backend/evaluation.py --url http://127.0.0.1:8000 --top_k 8 --verbose
 pytest tests/
 ```
 
-Runs automatically on every push/PR to `main` via `.github/workflows/ci.yml`.
+CI runs the test suite on every push and pull request (`.github/workflows/ci.yml`).
 
 ---
 
@@ -545,11 +598,12 @@ Runs automatically on every push/PR to `main` via `.github/workflows/ci.yml`.
 { "query": "best tacos in Philadelphia", "top_k": 8 }
 ```
 
-Response — NDJSON stream:
+The response is an NDJSON stream:
 ```
 {"type": "ping"}
 {"type": "meta", "data": {"retrieval_ms": 850, "results_count": 8, "reranked": true}}
 {"type": "sources", "data": [...]}
+{"type": "provider", "data": {"provider": "claude", "model": "claude-haiku-4-5"}}
 {"type": "token", "data": "Here"}
 {"type": "token", "data": " are"}
 ...
@@ -560,4 +614,6 @@ Response — NDJSON stream:
 ```json
 { "query": "late night ramen", "top_k": 5, "do_rerank": true }
 ```
+
+Optional fields: `k_rrf`, `initial_k`, `max_duplicates`, `no_cache`.
 
